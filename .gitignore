@@ -1,0 +1,14 @@
+.env
+options_data.db
+duckdb_cli-linux-amd64.zip
+
+
+# Pipeline outputs
+runs/
+*.parquet
+
+# Databases (DuckDB)
+*.db
+
+
+>>>>>>> Stashed changes
