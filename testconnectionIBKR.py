@@ -1,18 +1,21 @@
 # run: python3 testconnectionIBKR.py
 #
 # Tests connection to IB Gateway (Paper) and logs all events.
+# Adjustments:
+# - Treat IB "status" codes (2104/2106/2107/2158) as INFO, not ERROR
+# - Keep the connection open briefly (default 30s) before disconnecting
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 import threading
 import time
 import logging
-from datetime import datetime
 
 HOST = "127.0.0.1"
-PORT = 4002          # IB Gateway paper
+PORT = 4002          # IB Gateway: paper=4002, live=4001 | TWS: paper=7497, live=7496
 CLIENT_ID = 7        # use a non-1 clientId to avoid conflicts
 LOG_FILE = "ibkr_connection.log"
+HOLD_SECONDS = 30    # keep connection alive for a bit after nextValidId
 
 
 # ---------- logging ----------
@@ -27,6 +30,9 @@ logging.getLogger("").addHandler(console)
 
 
 class App(EWrapper, EClient):
+    # IB "error" callback also carries info/status messages; treat these as INFO.
+    INFO_CODES = {2104, 2106, 2107, 2158}
+
     def __init__(self):
         EClient.__init__(self, self)
         self.connected_ok = False
@@ -34,12 +40,18 @@ class App(EWrapper, EClient):
     def nextValidId(self, orderId: int):
         self.connected_ok = True
         logging.info(f"CONNECTED ✅ nextValidId={orderId}")
+
+        # Hold connection briefly so you can observe ESTABLISHED sockets, farm messages, etc.
+        time.sleep(HOLD_SECONDS)
+
         self.disconnect()
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        logging.error(
-            f"ERROR reqId={reqId} code={errorCode} msg={errorString}"
-        )
+        if errorCode in self.INFO_CODES:
+            logging.info(f"INFO reqId={reqId} code={errorCode} msg={errorString}")
+            return
+
+        logging.error(f"ERROR reqId={reqId} code={errorCode} msg={errorString}")
         if advancedOrderRejectJson:
             logging.error(f"advancedOrderRejectJson={advancedOrderRejectJson}")
 
@@ -49,12 +61,9 @@ class App(EWrapper, EClient):
 
 def main():
     logging.info("Starting IBKR Gateway connection test")
-
     app = App()
 
-    logging.info(
-        f"Connecting to {HOST}:{PORT} (clientId={CLIENT_ID})"
-    )
+    logging.info(f"Connecting to {HOST}:{PORT} (clientId={CLIENT_ID})")
     app.connect(HOST, PORT, clientId=CLIENT_ID)
 
     t = threading.Thread(target=app.run, daemon=True)
