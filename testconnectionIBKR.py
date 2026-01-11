@@ -10,7 +10,7 @@ import time
 
 
 HOST = "127.0.0.1"
-PORT = 7497  # Paper = 7497, Live = 7496
+PORT = 4002  # Paper = 7497, Live = 7496
 CLIENT_ID = 1
 
 
