@@ -2,6 +2,8 @@
 options_data.db
 duckdb_cli-linux-amd64.zip
 
+__pycache__/
+*.pyc
 
 # Pipeline outputs
 runs/
