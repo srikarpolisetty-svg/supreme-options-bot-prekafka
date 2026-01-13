@@ -179,9 +179,8 @@ class App(EWrapper, EClient):
 
             is_friday = (d.weekday() == 4)
             is_within_4_days = 0 <= (d - now).days <= 4
-            is_third_friday = is_friday and 15 <= d.day <= 21
 
-            if is_friday and is_within_4_days and not is_third_friday:
+            if is_friday and is_within_4_days:
                 return exp
         return None
 
