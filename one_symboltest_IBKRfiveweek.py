@@ -58,6 +58,7 @@ class App(EWrapper, EClient):
     # ---------- IB callbacks ----------
     def nextValidId(self, orderId: int):
         self.reqContractDetails(self._new_req_id(), make_stock(self.symbol))
+        self.reqMarketDataType(3)
 
     def contractDetails(self, reqId, cd):
         con = cd.contract
