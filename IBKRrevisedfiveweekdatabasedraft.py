@@ -185,7 +185,11 @@ class App(EWrapper, EClient):
 
         return None
 
-
+    def get_closest_strike_ibkr(self, target: float) -> float:
+        if not self.strikes:
+            raise RuntimeError("No strikes loaded yet.")
+        return float(min(self.strikes, key=lambda s: abs(float(s) - float(target))))
+    
     def qualify_option(self, opt: Contract, right: str, strike: float, exp: str):
         reqId = self._new_req_id()
         self._pending_opt_qualify[reqId] = (right, strike, exp)
