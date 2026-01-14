@@ -307,98 +307,100 @@ class App(EWrapper, EClient):
             raise RuntimeError("Did not qualify all option contracts in time.")
 
         # Pull qualified contracts back out
-        q_atm_c = self._qualified_opt_contracts[("C", atm_strike, exp)]
-        q_atm_p = self._qualified_opt_contracts[("P", atm_strike, exp)]
-        qc1 = self._qualified_opt_contracts[("C", c1, exp)]
-        qp1 = self._qualified_opt_contracts[("P", p1, exp)]
-        qc2 = self._qualified_opt_contracts[("C", c2, exp)]
-        q_p2 = self._qualified_opt_contracts[("P", p2, exp)]
+        # qualified contracts (Contracts)
+        atm_c_con = self._qualified_opt_contracts[("C", atm_strike, exp)]
+        atm_p_con = self._qualified_opt_contracts[("P", atm_strike, exp)]
+        c1_con    = self._qualified_opt_contracts[("C", c1, exp)]
+        p1_con    = self._qualified_opt_contracts[("P", p1, exp)]
+        c2_con    = self._qualified_opt_contracts[("C", c2, exp)]
+        p2_con    = self._qualified_opt_contracts[("P", p2, exp)]
 
-        # 6) Request market data snapshots for each option & collect quotes
-        q_atm_c_quote = self.get_option_quote_ibkr(q_atm_c, timeout=5.0)
-        q_atm_p_quote = self.get_option_quote_ibkr(q_atm_p, timeout=5.0)
-        q_c1 = self.get_option_quote_ibkr(qc1, timeout=5.0)
-        q_p1 = self.get_option_quote_ibkr(qp1, timeout=5.0)
-        q_c2 = self.get_option_quote_ibkr(qc2, timeout=5.0)
-        q_p2 = self.get_option_quote_ibkr(q_p2, timeout=5.0)
+        # quotes (dicts)
+        atm_c_q = self.get_option_quote_ibkr(atm_c_con, timeout=5.0)
+        atm_p_q = self.get_option_quote_ibkr(atm_p_con, timeout=5.0)
+        c1_q    = self.get_option_quote_ibkr(c1_con, timeout=5.0)
+        p1_q    = self.get_option_quote_ibkr(p1_con, timeout=5.0)
+        c2_q    = self.get_option_quote_ibkr(c2_con, timeout=5.0)
+        p2_q    = self.get_option_quote_ibkr(p2_con, timeout=5.0)
 
-        # Example prints (replace with your DB write)
+
         print(f"Underlying {self.symbol} last_price:", self.last_price)
         print("EXP:", exp)
-        print("ATM_C", atm_strike, q_atm_c_quote)
-        print("ATM_P", atm_strike, q_atm_p_quote)
-        print("C1", c1, q_c1)
-        print("P1", p1, q_p1)
-        print("C2", c2, q_c2)
-        print("P2", p2, q_p2)
+        print("ATM_C", atm_strike, atm_c_q)
+        print("ATM_P", atm_strike, atm_p_q)
+        print("C1", c1, c1_q)
+        print("P1", p1, p1_q)
+        print("C2", c2, c2_q)
+        print("P2", p2, p2_q)
 
         # ---------- ATM CALL ----------
-        atm_call_bid = q_atm_c_quote.get("bid")
-        atm_call_ask = q_atm_c_quote.get("ask")
-        atm_call_mid = q_atm_c_quote.get("mid")
-        atm_call_volume = q_atm_c_quote.get("volume")
-        atm_call_iv = q_atm_c_quote.get("iv")
-        atm_call_oi = q_atm_c_quote.get("oi")
-        atm_call_spread = q_atm_c_quote.get("spread")
-        atm_call_spread_pct = q_atm_c_quote.get("spread_pct")
+        atm_call_bid        = atm_c_q.get("bid")
+        atm_call_ask        = atm_c_q.get("ask")
+        atm_call_mid        = atm_c_q.get("mid")
+        atm_call_volume     = atm_c_q.get("volume")
+        atm_call_iv         = atm_c_q.get("iv")
+        atm_call_oi         = atm_c_q.get("oi")
+        atm_call_spread     = atm_c_q.get("spread")
+        atm_call_spread_pct = atm_c_q.get("spread_pct")
 
         # ---------- ATM PUT ----------
-        atm_put_bid = q_atm_p_quote.get("bid")
-        atm_put_ask = q_atm_p_quote.get("ask")
-        atm_put_mid = q_atm_p_quote.get("mid")
-        atm_put_volume = q_atm_p_quote.get("volume")
-        atm_put_iv = q_atm_p_quote.get("iv")
-        atm_put_oi = q_atm_p_quote.get("oi")
-        atm_put_spread = q_atm_p_quote.get("spread")
-        atm_put_spread_pct = q_atm_p_quote.get("spread_pct")
+        atm_put_bid         = atm_p_q.get("bid")
+        atm_put_ask         = atm_p_q.get("ask")
+        atm_put_mid         = atm_p_q.get("mid")
+        atm_put_volume      = atm_p_q.get("volume")
+        atm_put_iv          = atm_p_q.get("iv")
+        atm_put_oi          = atm_p_q.get("oi")
+        atm_put_spread      = atm_p_q.get("spread")
+        atm_put_spread_pct  = atm_p_q.get("spread_pct")
 
         # ---------- OTM1 CALL (C1) ----------
-        otm_call_1_bid = q_c1.get("bid")
-        otm_call_1_ask = q_c1.get("ask")
-        otm_call_1_mid = q_c1.get("mid")
-        otm_call_1_volume = q_c1.get("volume")
-        otm_call_1_iv = q_c1.get("iv")
-        otm_call_1_oi = q_c1.get("oi")
-        otm_call_1_spread = q_c1.get("spread")
-        otm_call_1_spread_pct = q_c1.get("spread_pct")
+        otm_call_1_bid        = c1_q.get("bid")
+        otm_call_1_ask        = c1_q.get("ask")
+        otm_call_1_mid        = c1_q.get("mid")
+        otm_call_1_volume     = c1_q.get("volume")
+        otm_call_1_iv         = c1_q.get("iv")
+        otm_call_1_oi         = c1_q.get("oi")
+        otm_call_1_spread     = c1_q.get("spread")
+        otm_call_1_spread_pct = c1_q.get("spread_pct")
 
         # ---------- OTM1 PUT (P1) ----------
-        otm_put_1_bid = q_p1.get("bid")
-        otm_put_1_ask = q_p1.get("ask")
-        otm_put_1_mid = q_p1.get("mid")
-        otm_put_1_volume = q_p1.get("volume")
-        otm_put_1_oi = q_p1.get("oi")
-        otm_put_1_spread = q_p1.get("spread")
-        otm_put_1_spread_pct = q_p1.get("spread_pct")
-        otm_put_1_iv = q_p1.get("iv")
-
+        otm_put_1_bid         = p1_q.get("bid")
+        otm_put_1_ask         = p1_q.get("ask")
+        otm_put_1_mid         = p1_q.get("mid")
+        otm_put_1_volume      = p1_q.get("volume")
+        otm_put_1_oi          = p1_q.get("oi")
+        otm_put_1_spread      = p1_q.get("spread")
+        otm_put_1_spread_pct  = p1_q.get("spread_pct")
+        otm_put_1_iv          = p1_q.get("iv")
 
         # ---------- OTM2 CALL (C2) ----------
-        otm_call_2_bid = q_c2.get("bid")
-        otm_call_2_ask = q_c2.get("ask")
-        otm_call_2_mid = q_c2.get("mid")
-        otm_call_2_volume = q_c2.get("volume")
-        otm_call_2_iv = q_c2.get("iv")
-        otm_call_2_oi = q_c2.get("oi")
-        otm_call_2_spread = q_c2.get("spread")
-        otm_call_2_spread_pct = q_c2.get("spread_pct")
+        otm_call_2_bid        = c2_q.get("bid")
+        otm_call_2_ask        = c2_q.get("ask")
+        otm_call_2_mid        = c2_q.get("mid")
+        otm_call_2_volume     = c2_q.get("volume")
+        otm_call_2_iv         = c2_q.get("iv")
+        otm_call_2_oi         = c2_q.get("oi")
+        otm_call_2_spread     = c2_q.get("spread")
+        otm_call_2_spread_pct = c2_q.get("spread_pct")
 
         # ---------- OTM2 PUT (P2) ----------
-        otm_put_2_bid = q_p2.get("bid")
-        otm_put_2_ask = q_p2.get("ask")
-        otm_put_2_mid = q_p2.get("mid")
-        otm_put_2_volume = q_p2.get("volume")
-        otm_put_2_iv = q_p2.get("iv")
-        otm_put_2_oi = q_p2.get("oi")
-        otm_put_2_spread = q_p2.get("spread")
-        otm_put_2_spread_pct = q_p2.get("spread_pct")
+        otm_put_2_bid         = p2_q.get("bid")
+        otm_put_2_ask         = p2_q.get("ask")
+        otm_put_2_mid         = p2_q.get("mid")
+        otm_put_2_volume      = p2_q.get("volume")
+        otm_put_2_iv          = p2_q.get("iv")
+        otm_put_2_oi          = p2_q.get("oi")
+        otm_put_2_spread      = p2_q.get("spread")
+        otm_put_2_spread_pct  = p2_q.get("spread_pct")
 
-        atm_call_conid = q_atm_c.conId
-        atm_put_conid = q_atm_p.conId
-        otm1_call_conid = qc1.conId
-        otm1_put_conid = qp1.conId
-        otm2_call_conid = qc2.conId
-        otm2_put_conid = q_p2.conId
+        # conIds (from Contracts, not quote dicts)
+        atm_call_conid = atm_c_con.conId
+        atm_put_conid  = atm_p_con.conId
+        otm1_call_conid = c1_con.conId
+        otm1_put_conid  = p1_con.conId
+        otm2_call_conid = c2_con.conId
+        otm2_put_conid  = p2_con.conId
+
 
         import datetime
         import pytz
@@ -868,11 +870,6 @@ class App(EWrapper, EClient):
         # ======================
         # EXECUTION SIGNALS (5W)
         # ======================        atm_call_conid = q_atm_c.conId
-        atm_put_conid = q_atm_p.conId
-        otm1_call_conid = qc1.conId
-        otm1_put_conid = qp1.conId
-        otm2_call_conid = qc2.conId
-        otm2_put_conid = q_p2.conId
 
         cols3 = [
             "con_id",
