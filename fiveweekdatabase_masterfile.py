@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from IBKRrevisedfiveweekdatabasedraft import main_parquet
 
 from fiveweekdatabase import ingest_option_snapshot_5w
 import pandas as pd
@@ -72,37 +72,42 @@ def get_sp500_symbols(retries: int = 3, backoff_sec: float = 2.0, timeout_sec: f
 
 
 
+import argparse
+
 def main():
     # ---- shard args ----
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--run_id", required=True)
+    parser.add_argument("--client_id_base", type=int, default=1000)  # optional
     args = parser.parse_args()
 
-    run_id = args.run_id
-
     # ---- load + shard symbols ----
-    symbols = get_sp500_symbols()
-    symbols = sorted(symbols)  # stable ordering
-
+    symbols = sorted(get_sp500_symbols())  # stable ordering
     my_symbols = symbols[args.shard::args.shards]
 
-    print(f"[5W] Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={run_id})")
+    print(f"[5W] Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={args.run_id})")
+
+    # ---- unique client id per shard ----
+    client_id = args.client_id_base + args.shard
 
     # ---- process (parquet only) ----
-    for symbol in my_symbols:
-        try:
-            ingest_option_snapshot_5w(symbol, args.shard, run_id)
-
-        except Exception as e:
-            print(f"Error ingesting {symbol}: {e}")
-
-        time.sleep(0.3)
-
+    try:
+        main_parquet(
+            client_id=client_id,
+            shard=args.shard,
+            num_shards=args.shards,
+            run_id=args.run_id,
+            symbolss=my_symbols,
+        )
+    except Exception as e:
+        print(f"Shard {args.shard} failed: {e}")
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

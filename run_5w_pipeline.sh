@@ -20,12 +20,16 @@ echo "RUN_ID=$RUN_ID"
 git rev-parse --short HEAD || true
 
 for SHARD in {0..3}; do
+  CLIENT_ID=$((1000 + SHARD))
+
   /home/ubuntu/optionsenv/bin/python -u fiveweekdatabase_masterfile.py \
     --shard $SHARD \
     --shards 4 \
     --run_id "$RUN_ID" \
+    --client_id $CLIENT_ID \
     >> "$LOGDIR/5week_${SHARD}.log" 2>&1 &
 done
+
 
 wait
 

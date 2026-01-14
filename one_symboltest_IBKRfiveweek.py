@@ -1,12 +1,11 @@
+
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-import threading
-import time
-import datetime
+import threading, time, datetime
 import pandas as pd
 
-HOST, PORT, CLIENT_ID = "127.0.0.1", 4002, 7
+HOST, PORT = "127.0.0.1", 4002
 
 
 def make_stock(symbol: str) -> Contract:
@@ -32,8 +31,25 @@ def make_option(symbol: str, exp_yyyymmdd: str, strike: float, right: str) -> Co
 
 
 class App(EWrapper, EClient):
-    def __init__(self, symbol: str):
+    def __init__(self):
         EClient.__init__(self, self)
+
+        self.symbol = None
+        self.connected_event = threading.Event()
+
+        self._next_req_id = 1
+        self._next_ticker_id = 5000
+
+        self.reqid_to_conid = {}
+        self.quote_by_conid = {}
+
+        self.reset_for_symbol("__init__")
+
+    def nextValidId(self, orderId: int):
+        self.reqMarketDataType(3)
+        self.connected_event.set()
+
+    def reset_for_symbol(self, symbol: str):
         self.symbol = symbol
 
         self.underlying_conId = None
@@ -42,25 +58,18 @@ class App(EWrapper, EClient):
         self.expirations = set()
         self.strikes = set()
 
-        self._next_req_id = 1
-        self._next_ticker_id = 5000
-
-        self.reqid_to_conid = {}
-        self.quote_by_conid = {}
-
         self._got_underlying_price = threading.Event()
         self._got_chain = threading.Event()
 
-        self._pending_opt_qualify = {}       # reqId -> (right, strike, exp)
-        self._qualified_opt_contracts = {}   # (right, strike, exp) -> Contract(with conId)
-        self._pending_snapshot = {}          # tickerId -> threading.Event
+        self._pending_opt_qualify = {}
+        self._qualified_opt_contracts = {}
+        self._pending_snapshot = {}
 
-    # ---------- IB callbacks ----------
-    def nextValidId(self, orderId: int):
-        self.reqContractDetails(self._new_req_id(), make_stock(self.symbol))
-        self.reqMarketDataType(3)
+    def start_symbol(self, symbol: str):
+        self.reset_for_symbol(symbol)
+        self.reqContractDetails(self._new_req_id(), make_stock(symbol))
 
-    def contractDetails(self, reqId, cd):
+      def contractDetails(self, reqId, cd):
         con = cd.contract
 
         # Underlying contract details
@@ -163,6 +172,14 @@ class App(EWrapper, EClient):
         rid = self._next_req_id
         self._next_req_id += 1
         return rid
+
+
+
+
+    def run_sequence(self, symbol: str) -> pd.DataFrame:
+        self.start_symbol(symbol)
+
+       
 
     def get_closest_strike_ibkr(self, target: float) -> float:
         if not self.strikes:
@@ -389,18 +406,59 @@ class App(EWrapper, EClient):
         print(df3)
 
 
-def main():
-    app = App("AAPL")
-    app.connect(HOST, PORT, clientId=CLIENT_ID)
+        # ---- PASTE YOUR EXISTING run_sequence BODY HERE ----
+        # everything from:
+        #   if not self._got_underlying_price.wait(...)
+        # down to:
+        #   return df3 (or df2/df1)
+        #
+        # IMPORTANT: at the end, RETURN a df (df1/df2/df3)
+        #
+        # return df3
+        raise NotImplementedError
 
-    t = threading.Thread(target=app.run, daemon=True)
-    t.start()
+    # ---------- keep all your other callbacks/helpers below ----------
+    def _new_req_id(self) -> int:
+        rid = self._next_req_id
+        self._next_req_id += 1
+        return rid
 
+    # keep: contractDetails, securityDefinitionOptionParameter*, tickPrice, tickSize,
+    # tickOptionComputation, request_market_data, qualify_option, get_option_quote_ibkr, etc.
+
+
+def open_connection(client_id: int) -> App:
+    app = App()
+    app.connect(HOST, PORT, clientId=client_id)
+
+    threading.Thread(target=app.run, daemon=True).start()
+
+    if not app.connected_event.wait(timeout=10):
+        raise RuntimeError("Failed to connect")
+
+    return app
+
+
+def fetch_ibkr_option_snapshot(app: App, symbol: str, shard: int, num_shards: int, run_id: str):
+    # shard skip
+    if (hash(symbol) % num_shards) != shard:
+        return None
+
+    df = app.run_sequence(symbol)
+
+    # TODO: write parquet with run_id/symbol/timestamp
+    return df
+
+
+def main(client_id: int, shard: int, num_shards: int, run_id: str):
+    app = open_connection(client_id)
     try:
-        app.run_sequence()
+        for symbol in my_symbols:
+            fetch_ibkr_option_snapshot(app, symbol, shard, num_shards, run_id)
+            time.sleep(0.3)
     finally:
         app.disconnect()
 
 
 if __name__ == "__main__":
-    main()
+    main(client_id=7, shard=0, num_shards=1, run_id="test")

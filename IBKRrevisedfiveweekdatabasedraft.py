@@ -1,14 +1,18 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+from fiveweekdatabase_masterfile import get_sp500_symbols
 import threading
 import time
 import datetime
 import pandas as pd
 import os
+import pytz
+import duckdb
+
 from databasefunctions import compute_z_scores_for_bucket_5w
 
-HOST, PORT, CLIENT_ID = "127.0.0.1", 4002, 7
+HOST, PORT = "127.0.0.1", 4002
 
 
 def make_stock(symbol: str) -> Contract:
@@ -26,61 +30,59 @@ def make_option(symbol: str, exp_yyyymmdd: str, strike: float, right: str) -> Co
     c.secType = "OPT"
     c.exchange = "SMART"
     c.currency = "USD"
-    c.lastTradeDateOrContractMonth = exp_yyyymmdd  # IB format: YYYYMMDD
+    c.lastTradeDateOrContractMonth = exp_yyyymmdd
     c.strike = float(strike)
-    c.right = right  # "C" or "P"
+    c.right = right
     c.multiplier = "100"
     return c
 
 
 class App(EWrapper, EClient):
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str = ""):
         EClient.__init__(self, self)
 
         self.symbol = symbol
+        self.connected_event = threading.Event()
 
-        # underlying
-        self.underlying_conId = None
-        self.last_price = None
-
-        # chain
-        self.expirations = set()
-        self.strikes = set()
-        self.got_chain = False
-
-        # reqId bookkeeping
         self._next_req_id = 1
         self._next_ticker_id = 5000
 
         self.reqid_to_conid = {}
         self.quote_by_conid = {}
 
-        # workflow flags
+        self.reset_for_symbol(symbol)
+
+    def nextValidId(self, orderId: int):
+        self.reqMarketDataType(3)  # delayed-ok
+        self.connected_event.set()
+
+    def reset_for_symbol(self, symbol: str):
+        self.symbol = symbol
+
+        self.underlying_conId = None
+        self.last_price = None
+
+        self.expirations = set()
+        self.strikes = set()
+
         self._got_underlying_price = threading.Event()
         self._got_chain = threading.Event()
 
-        # option qualification + quote snapshot waits
-        self._pending_opt_qualify = {}  # reqId -> ("C"/"P", strike, exp)
-        self._qualified_opt_contracts = {}  # key -> Contract(with conId)
-        self._pending_snapshot = {}  # tickerId -> threading.Event
-        self.exp = None
+        self._pending_opt_qualify = {}
+        self._qualified_opt_contracts = {}
+        self._pending_snapshot = {}
 
-    # ---------- IB callbacks ----------
-    def nextValidId(self, orderId: int):
-        # 1) Request underlying details (to get conId)
-        self.reqContractDetails(self._new_req_id(), make_stock(self.symbol))
+    def start_symbol(self, symbol: str):
+        self.reset_for_symbol(symbol)
+        self.reqContractDetails(self._new_req_id(), make_stock(symbol))
 
     def contractDetails(self, reqId, cd):
         con = cd.contract
 
-        # Underlying contract details
         if con.secType == "STK" and self.underlying_conId is None:
             self.underlying_conId = con.conId
-
-            # 2) Request underlying market data snapshot (to get last)
             self.request_market_data(con, snapshot=True)
 
-            # 3) Request option chain definition (needs underlying conId)
             self.reqSecDefOptParams(
                 reqId=self._new_req_id(),
                 underlyingSymbol=self.symbol,
@@ -90,138 +92,93 @@ class App(EWrapper, EClient):
             )
             return
 
-        # Option contract details (qualification)
         if con.secType == "OPT":
             meta = self._pending_opt_qualify.pop(reqId, None)
             if meta is not None:
                 right, strike, exp = meta
-                key = (right, float(strike), exp)
-                self._qualified_opt_contracts[key] = con
+                self._qualified_opt_contracts[(right, float(strike), exp)] = con
 
     def securityDefinitionOptionParameter(
         self, reqId, exchange, underlyingConId, tradingClass, multiplier, expirations, strikes
     ):
-        # collecting strikes and expirations over multiple iterations
         self.expirations.update(expirations)
         self.strikes.update(strikes)
 
-    def securityDefinitionOptionParameterEnd(self, reqId):  # done getting all exiprations and strikes
-        self.got_chain = True
+    def securityDefinitionOptionParameterEnd(self, reqId):
         self._got_chain.set()
 
-    def tickPrice(self, reqId, tickType, price, attrib):  # assembling the quote piece by piece
-        # Underlying snapshot "last" is tickType=4, close is 9.
-        if reqId in self.reqid_to_conid:
-            conId = self.reqid_to_conid[reqId]  # identifying what tick it belongs to
-            q = self.quote_by_conid.setdefault(conId, {})
-
-            if tickType == 1:  # bid
-                q["bid"] = price
-            elif tickType == 2:  # ask
-                q["ask"] = price
-            elif tickType == 4:  # last
-                q["last"] = price
-            elif tickType == 9:  # close
-                q["close"] = price
-
-            # If this is the underlying, latch a usable last_price
-            if self.underlying_conId is not None and conId == self.underlying_conId:
-                if price is not None and price > 0:
-                    # Prefer last, fall back to close if needed
-                    if tickType == 4:
-                        self.last_price = price
-                        self._got_underlying_price.set()
-                    elif tickType == 9 and self.last_price is None:
-                        self.last_price = price
-                        self._got_underlying_price.set()  # prefers to get the last price if possible
-
-            # once I get all the data , I am done with this so I can set it as done
-            done_event = self._pending_snapshot.get(reqId)
-            if done_event is not None:
-                got_bid_ask = ("bid" in q and "ask" in q and q["bid"] is not None and q["ask"] is not None)
-                got_last = ("last" in q and q["last"] is not None and q["last"] > 0)
-                if got_bid_ask or got_last:
-                    done_event.set()
-
-    def tickSize(self, reqId, tickType, size):  # getting other information
-        if reqId in self.reqid_to_conid:
-            conId = self.reqid_to_conid[reqId]
-            q = self.quote_by_conid.setdefault(conId, {})
-
-            if tickType == 0:  # bid size
-                q["bidSize"] = size
-            elif tickType == 3:  # ask size
-                q["askSize"] = size
-            elif tickType == 5:  # last size
-                q["lastSize"] = size
-            elif tickType == 8:  # volume
-                q["volume"] = size
-            elif tickType == 27:  # open interest (often arrives via tickOptionComputation/other ticks depending on subscription)
-                q["oi"] = size
-
-    def tickOptionComputation(
-        self,
-        reqId,
-        tickType,
-        impliedVol,
-        delta,
-        optPrice,
-        pvDividend,
-        gamma,
-        vega,
-        theta,
-        undPrice,
-    ):
-        # We only care about MODEL Greeks/IV
-        if tickType != 13:  # 13 = MODEL
-            return
-
+    def tickPrice(self, reqId, tickType, price, attrib):
         if reqId not in self.reqid_to_conid:
-            return
-
-        if impliedVol is None or impliedVol < 0:
             return
 
         conId = self.reqid_to_conid[reqId]
         q = self.quote_by_conid.setdefault(conId, {})
-        q["iv"] = impliedVol
 
-    # ---------- helpers ---------- # every request needs a new separate id
+        if tickType == 1:
+            q["bid"] = price
+        elif tickType == 2:
+            q["ask"] = price
+        elif tickType == 4:
+            q["last"] = price
+        elif tickType == 9:
+            q["close"] = price
+
+        if conId == self.underlying_conId and price and price > 0:
+            if tickType in (4, 9):
+                self.last_price = price
+                self._got_underlying_price.set()
+
+        done_event = self._pending_snapshot.get(reqId)
+        if done_event:
+            if ("bid" in q and "ask" in q) or ("last" in q):
+                done_event.set()
+
+    def tickSize(self, reqId, tickType, size):
+        if reqId not in self.reqid_to_conid:
+            return
+
+        conId = self.reqid_to_conid[reqId]
+        q = self.quote_by_conid.setdefault(conId, {})
+
+        if tickType == 0:
+            q["bidSize"] = size
+        elif tickType == 3:
+            q["askSize"] = size
+        elif tickType == 5:
+            q["lastSize"] = size
+        elif tickType == 8:
+            q["volume"] = size
+        elif tickType == 27:
+            q["oi"] = size
+
+    def tickOptionComputation(
+        self, reqId, tickType, impliedVol, delta, optPrice,
+        pvDividend, gamma, vega, theta, undPrice
+    ):
+        if tickType != 13 or impliedVol is None or impliedVol < 0:
+            return
+
+        conId = self.reqid_to_conid.get(reqId)
+        if conId is None:
+            return
+
+        self.quote_by_conid.setdefault(conId, {})["iv"] = impliedVol
+
     def _new_req_id(self) -> int:
         rid = self._next_req_id
         self._next_req_id += 1
         return rid
 
     def get_closest_strike_ibkr(self, target: float) -> float:
-        if not self.strikes:
-            raise RuntimeError("No strikes loaded yet.")
-        return float(min(self.strikes, key=lambda s: abs(float(s) - float(target))))
-
-    def get_friday_within_4_days(self) -> str | None:
-        if not self.expirations:
-            return None
-
-        now = datetime.date.today()
-        for exp in sorted(self.expirations):
-            d = datetime.datetime.strptime(exp, "%Y%m%d").date()
-
-            is_friday = (d.weekday() == 4)
-            is_within_4_days = 0 <= (d - now).days <= 4
-            is_third_friday = is_friday and 15 <= d.day <= 21  # monthly exp
-
-            if is_friday and is_within_4_days and not is_third_friday:
-                return exp
-        return None
+        return float(min(self.strikes, key=lambda s: abs(float(s) - target)))
 
     def qualify_option(self, opt: Contract, right: str, strike: float, exp: str):
         reqId = self._new_req_id()
         self._pending_opt_qualify[reqId] = (right, strike, exp)
-        self.reqContractDetails(reqId, opt)
+        self.reqContractDetails(reqId, opt)   # <-- THIS is the actual qualify request
 
-    def request_market_data(self, contract: Contract, snapshot: bool = True) -> int:
-        if not getattr(contract, "conId", 0):
-            raise ValueError("Contract must be qualified (conId set) before requesting market data.")
 
+    def request_market_data(self, contract: Contract, snapshot=True) -> int:
         reqId = self._next_ticker_id
         self._next_ticker_id += 1
 
@@ -233,39 +190,12 @@ class App(EWrapper, EClient):
 
         generic_ticks = "106" if contract.secType == "OPT" else ""
 
-        self.reqMktData(
-            reqId,
-            contract,
-            generic_ticks,  # <-- changed
-            snapshot,
-            False,
-            [],
-        )
+        self.reqMktData(reqId, contract, generic_ticks, snapshot, False, [])
         return reqId
 
-    def get_option_quote_ibkr(self, opt_contract: Contract, timeout: float = 5.0) -> dict:
-        # Snapshot request and wait for at least bid/ask or last
-        tickerId = self.request_market_data(opt_contract, snapshot=True)
-        ev = self._pending_snapshot[tickerId]
+    def run_sequence(self, run_id: str, shard_id: int):
 
-        ev.wait(timeout=timeout)
-
-        conId = opt_contract.conId
-        q = dict(self.quote_by_conid.get(conId, {}))
-
-        # Compute mids/spread if possible
-        bid = q.get("bid")
-        ask = q.get("ask")
-        if bid is not None and ask is not None and ask > 0:
-            q["mid"] = (bid + ask) / 2.0
-            q["spread"] = ask - bid
-            q["spread_pct"] = (ask - bid) / ((ask + bid) / 2.0) if (ask + bid) else None
-
-        return q
-
-    # ---------- main workflow ----------
-    def run_sequence(self):
-        # Wait for underlying last_price (max ~10s)
+                # Wait for underlying last_price (max ~10s)
         if not self._got_underlying_price.wait(timeout=10.0):
             # If we didn't get last, try to proceed if close came in
             if self.last_price is None:
@@ -392,7 +322,8 @@ class App(EWrapper, EClient):
         otm_put_1_oi = q_p1.get("oi")
         otm_put_1_spread = q_p1.get("spread")
         otm_put_1_spread_pct = q_p1.get("spread_pct")
-        otm_put_1_iv = q_c1.get("iv")
+        otm_put_1_iv = q_p1.get("iv")
+
 
         # ---------- OTM2 CALL (C2) ----------
         otm_call_2_bid = q_c2.get("bid")
@@ -451,7 +382,7 @@ class App(EWrapper, EClient):
         p1 = self.get_closest_strike_ibkr(otm_put_1_target)
         c2 = self.get_closest_strike_ibkr(otm_call_2_target)
         p2 = self.get_closest_strike_ibkr(otm_put_2_target)
-  def master_ingest_snapshot5w:
+  
         cols1 = [
             "con_id",
             "snapshot_id",
@@ -673,7 +604,7 @@ class App(EWrapper, EClient):
 
 
         cols2 = [
-            "con_id"
+            "con_id",
             "snapshot_id",
             "timestamp",
             "symbol",
@@ -896,7 +827,7 @@ class App(EWrapper, EClient):
         otm2_put_conid = q_p2.conId
 
         cols3 = [
-            "con_id"
+            "con_id",
             "snapshot_id",
             "timestamp",
             "symbol",
@@ -1150,78 +1081,29 @@ class App(EWrapper, EClient):
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
         df3.to_parquet(out_path, index=False)
-
-        # ======================
-        # MASTER INGEST (5W) - embedded, no params
-        # ======================
+        pass
 
 
-import duckdb
+def open_connection(client_id: int) -> App:
+    app = App()
+    app.connect(HOST, PORT, clientId=client_id)
 
-import duckdb
+    threading.Thread(target=app.run, daemon=True).start()
+
+    if not app.connected_event.wait(timeout=10):
+        raise RuntimeError("Failed to connect")
+
+    return app
 
 
-def master_ingest_5w(run_id: str, db_path: str = "options_data.db"):
-    """
-    Master ingest for a single 5W options run_id.
-    Reads parquet written by shards and inserts into existing tables.
-    """
 
-    raw_dir = f"runs/{run_id}/option_snapshots_raw_5w"
-    enriched_dir = f"runs/{run_id}/option_snapshots_enriched_5w"
-    signals_dir = f"runs/{run_id}/option_snapshots_execution_signals_5w"
-
-    con = duckdb.connect(db_path)
-
+def main_parquet(client_id: int, shard: int, run_id: str, symbols):
+    app = open_connection(client_id)
     try:
-        con.execute("BEGIN;")
-
-        con.execute(
-            """
-            INSERT INTO option_snapshots_execution_signals_5w
-            SELECT * FROM read_parquet(?)
-        """,
-            [f"{signals_dir}/shard_*.parquet"],
-        )
-
-        con.execute(
-            """
-            INSERT INTO option_snapshots_enriched_5w
-            SELECT * FROM read_parquet(?)
-        """,
-            [f"{enriched_dir}/shard_*.parquet"],
-        )
-
-        con.execute(
-            """
-            INSERT INTO option_snapshots_raw_5w
-            SELECT * FROM read_parquet(?)
-        """,
-            [f"{raw_dir}/shard_*.parquet"],
-        )
-
-        con.execute("COMMIT;")
-
-    except Exception:
-        con.execute("ROLLBACK;")
-        raise
-
-    finally:
-        con.close()
-
-
-def main():
-    app = App("AAPL")
-    app.connect(HOST, PORT, clientId=CLIENT_ID)
-
-    t = threading.Thread(target=app.run, daemon=True)
-    t.start()
-
-    try:
-        app.run_sequence()
+        for symbol in symbols:
+            app.start_symbol(symbol)
+            app.run_sequence(run_id=run_id, shard_id=shard)
+            time.sleep(0.3)
     finally:
         app.disconnect()
 
-
-if __name__ == "__main__":
-    main()
