@@ -168,8 +168,23 @@ class App(EWrapper, EClient):
         self._next_req_id += 1
         return rid
 
-    def get_closest_strike_ibkr(self, target: float) -> float:
-        return float(min(self.strikes, key=lambda s: abs(float(s) - target)))
+    def get_friday_within_4_days(self) -> str | None:
+        if not self.expirations:
+            return None
+
+        now = datetime.date.today()
+
+        for exp in sorted(self.expirations):
+            d = datetime.datetime.strptime(exp, "%Y%m%d").date()
+
+            is_friday = (d.weekday() == 4)
+            is_within_4_days = 0 <= (d - now).days <= 4
+
+            if is_friday and is_within_4_days:
+                return exp
+
+        return None
+
 
     def qualify_option(self, opt: Contract, right: str, strike: float, exp: str):
         reqId = self._new_req_id()
