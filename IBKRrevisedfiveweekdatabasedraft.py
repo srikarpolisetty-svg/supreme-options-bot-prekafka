@@ -151,7 +151,7 @@ class App(EWrapper, EClient):
             q["oi"] = size
 
     def tickOptionComputation(
-        self, reqId, tickType, impliedVol, delta, optPrice,
+        self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice,
         pvDividend, gamma, vega, theta, undPrice
     ):
         if tickType != 13 or impliedVol is None or impliedVol < 0:
