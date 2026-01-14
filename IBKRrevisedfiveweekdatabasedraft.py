@@ -212,34 +212,22 @@ class App(EWrapper, EClient):
 
         return q
 
-    def request_market_data(self, contract: Contract, snapshot: bool = True) -> int:
-        # Type / sanity checks
-        if not isinstance(contract, IBContract):
-            raise TypeError(
-                f"request_market_data expected Contract, got {type(contract)}: {contract}"
-            )
-
-        if not getattr(contract, "conId", 0):
-            raise RuntimeError(f"Contract missing conId: {contract}")
-
-        # Allocate ticker reqId
+    def request_market_data(self, contract: Contract, snapshot=True) -> int:
         reqId = self._next_ticker_id
         self._next_ticker_id += 1
 
-        # Track mapping + quote store
         self.reqid_to_conid[reqId] = contract.conId
         self.quote_by_conid.setdefault(contract.conId, {})
 
-        # Snapshot completion event
         if snapshot:
             self._pending_snapshot[reqId] = threading.Event()
+            generic_ticks = ""          # ✅ NO generic ticks for snapshots
+        else:
+            generic_ticks = "106" if contract.secType == "OPT" else ""
 
-        # Generic ticks: 106 = option implied vol etc. (only for OPT)
-        generic_ticks = "106" if contract.secType == "OPT" else ""
-
-        # Request market data
         self.reqMktData(reqId, contract, generic_ticks, snapshot, False, [])
         return reqId
+
 
     def run_sequence(self, run_id: str, shard_id: int):
 
