@@ -438,7 +438,6 @@ class App(EWrapper, EClient):
             "snapshot_id",
             "timestamp",
             "symbol",
-            "option_symbol",
             "strike",
             "call_put",
             "days_to_expiry",
@@ -584,7 +583,6 @@ class App(EWrapper, EClient):
             ],
         ]
 
-        df1 = pd.DataFrame(rows1, columns=cols1)
 
         df1 = pd.DataFrame(rows1, columns=cols1)
 
