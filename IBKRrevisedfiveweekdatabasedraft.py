@@ -195,6 +195,22 @@ class App(EWrapper, EClient):
         self._pending_opt_qualify[reqId] = (right, strike, exp)
         self.reqContractDetails(reqId, opt)   # <-- THIS is the actual qualify request
 
+    def get_option_quote_ibkr(self, opt_contract: Contract, timeout: float = 5.0) -> dict:
+        tickerId = self.request_market_data(opt_contract, snapshot=True)
+        ev = self._pending_snapshot[tickerId]
+        ev.wait(timeout=timeout)
+
+        conId = opt_contract.conId
+        q = dict(self.quote_by_conid.get(conId, {}))
+
+        bid = q.get("bid")
+        ask = q.get("ask")
+        if bid is not None and ask is not None and ask > 0:
+            q["mid"] = (bid + ask) / 2.0
+            q["spread"] = ask - bid
+            q["spread_pct"] = (ask - bid) / ((ask + bid) / 2.0) if (ask + bid) else None
+
+        return q
 
     def request_market_data(self, contract: Contract, snapshot=True) -> int:
         reqId = self._next_ticker_id
