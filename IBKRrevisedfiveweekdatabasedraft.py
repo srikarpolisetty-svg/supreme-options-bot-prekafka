@@ -1,7 +1,6 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from fiveweekdatabase_masterfile import get_sp500_symbols
 import threading
 import time
 import datetime
