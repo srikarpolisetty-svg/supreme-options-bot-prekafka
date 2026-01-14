@@ -37,7 +37,6 @@ def main():
         main_parquet(
             client_id=client_id,
             shard=args.shard,
-            num_shards=args.shards,
             run_id=args.run_id,
             symbolss=my_symbols,
         )
