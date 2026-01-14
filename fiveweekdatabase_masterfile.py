@@ -38,7 +38,7 @@ def main():
             client_id=client_id,
             shard=args.shard,
             run_id=args.run_id,
-            symbolss=my_symbols,
+            symbols=my_symbols,
         )
     except Exception as e:
         print(f"Shard {args.shard} failed: {e}")
