@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-cd /home/ubuntu/supreme-options-bot || exit 1
+cd /home/ubuntu/supreme-options-bot-prekafka || exit 1
 
-LOGDIR="/home/ubuntu/supreme-options-bot/logs"
+LOGDIR="/home/ubuntu/supreme-options-bot-prekafka/logs"
 mkdir -p "$LOGDIR"
 
 # 🔴 WRAPPER LOG: capture EVERYTHING (cron-safe)
