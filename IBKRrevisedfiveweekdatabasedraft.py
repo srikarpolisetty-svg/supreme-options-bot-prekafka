@@ -146,11 +146,18 @@ class App(EWrapper, EClient):
             if tickType in (4, 9):
                 self.last_price = price
                 self._got_underlying_price.set()
+            else:
+                b = q.get("bid")
+                a = q.get("ask")
+                if b is not None and a is not None and b > 0 and a > 0 and self.last_price is None:
+                    self.last_price = (b + a) / 2.0
+                    self._got_underlying_price.set()
 
         done_event = self._pending_snapshot.get(reqId)
         if done_event:
             if ("bid" in q and "ask" in q) or ("last" in q):
                 done_event.set()
+
 
     def tickSize(self, reqId, tickType, size):
         if reqId not in self.reqid_to_conid:
@@ -299,10 +306,13 @@ class App(EWrapper, EClient):
     def run_sequence(self, run_id: str, shard_id: int):
 
                 # Wait for underlying last_price (max ~10s)
+        # Wait for underlying last_price (max ~10s)
         if not self._got_underlying_price.wait(timeout=10.0):
             # If we didn't get last, try to proceed if close came in
             if self.last_price is None:
-                raise RuntimeError("Did not receive underlying price snapshot in time.")
+                print(f"skip {self.symbol}: did not receive underlying price snapshot in time.")
+                return None
+
 
         # Wait for chain (max ~15s)
         if not self._got_chain.wait(timeout=15.0):
