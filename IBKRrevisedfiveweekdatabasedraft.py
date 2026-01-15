@@ -231,7 +231,7 @@ class App(EWrapper, EClient):
         self.reqContractDetails(reqId, opt)
 
         # wait (DO NOT hang forever)
-        ev.wait(timeout=2.0)
+        ev.wait(timeout=0.6)
 
         # ---- CRITICAL PART ----
         # if IB said "no security definition", skip safely
@@ -307,7 +307,7 @@ class App(EWrapper, EClient):
 
                 # Wait for underlying last_price (max ~10s)
         # Wait for underlying last_price (max ~10s)
-        if not self._got_underlying_price.wait(timeout=10.0):
+        if not self._got_underlying_price.wait(timeout=5.0):
             # If we didn't get last, try to proceed if close came in
             if self.last_price is None:
                 print(f"skip {self.symbol}: did not receive underlying price snapshot in time.")
@@ -315,8 +315,10 @@ class App(EWrapper, EClient):
 
 
         # Wait for chain (max ~15s)
-        if not self._got_chain.wait(timeout=15.0):
-            raise RuntimeError("Did not receive option chain in time.")
+        if not self._got_chain.wait(timeout=8.0):
+            print(f"skip {self.symbol}: did not receive option chain in time.")
+            return None
+
 
         exp = self.get_friday_within_4_days()
         if exp is None:
@@ -362,23 +364,6 @@ class App(EWrapper, EClient):
             return None  # caller: treat as "skip symbol"
 
 
-        # Give IB a moment to return contractDetails (or you can wait loop)
-        deadline = time.time() + 10.0
-        needed = {
-            ("C", atm_strike, exp),
-            ("P", atm_strike, exp),
-            ("C", c1, exp),
-            ("P", p1, exp),
-            ("C", c2, exp),
-            ("P", p2, exp),
-        }
-        while time.time() < deadline:
-            if needed.issubset(set(self._qualified_opt_contracts.keys())):
-                break
-            time.sleep(0.05)
-
-        if not needed.issubset(set(self._qualified_opt_contracts.keys())):
-            raise RuntimeError("Did not qualify all option contracts in time.")
 
         # Pull qualified contracts back out
         # qualified contracts (Contracts)
@@ -390,12 +375,12 @@ class App(EWrapper, EClient):
         p2_con    = self._qualified_opt_contracts[("P", p2, exp)]
 
         # quotes (dicts)
-        atm_c_q = self.get_option_quote_ibkr(atm_c_con, timeout=5.0)
-        atm_p_q = self.get_option_quote_ibkr(atm_p_con, timeout=5.0)
-        c1_q    = self.get_option_quote_ibkr(c1_con, timeout=5.0)
-        p1_q    = self.get_option_quote_ibkr(p1_con, timeout=5.0)
-        c2_q    = self.get_option_quote_ibkr(c2_con, timeout=5.0)
-        p2_q    = self.get_option_quote_ibkr(p2_con, timeout=5.0)
+        atm_c_q = self.get_option_quote_ibkr(atm_c_con, timeout=2.0)
+        atm_p_q = self.get_option_quote_ibkr(atm_p_con, timeout=2.0)
+        c1_q    = self.get_option_quote_ibkr(c1_con, timeout=2.0)
+        p1_q    = self.get_option_quote_ibkr(p1_con, timeout=2.0)
+        c2_q    = self.get_option_quote_ibkr(c2_con, timeout=2.0)
+        p2_q    = self.get_option_quote_ibkr(p2_con, timeout=2.0)
 
 
         print(f"Underlying {self.symbol} last_price:", self.last_price)
