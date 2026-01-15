@@ -14,6 +14,7 @@ whoami
 pwd
 
 RUN_ID=$(date +"%Y-%m-%d_%H-%M-%S")
+START_TS=$(date +%s)
 echo "RUN_ID=$RUN_ID"
 
 # Record code version (read-only, safe)
@@ -34,5 +35,9 @@ wait
 
 /home/ubuntu/optionsenv/bin/python -u masteringest.py \
   --run_id "$RUN_ID" >> "$LOGDIR/masteringest.log" 2>&1
+
+END_TS=$(date +%s)
+TOTAL_RUNTIME_SECONDS=$((END_TS - START_TS))
+echo "TOTAL_RUNTIME_SECONDS=$TOTAL_RUNTIME_SECONDS"
 
 echo "===== CRON END $(date) ====="
