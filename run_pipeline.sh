@@ -20,12 +20,12 @@ echo "RUN_ID=$RUN_ID"
 # Record code version (read-only, safe)
 git rev-parse --short HEAD || true
 
-for SHARD in {0..3}; do
+for SHARD in {0..7}; do
   CLIENT_ID=$((1000 + SHARD))
 
   /home/ubuntu/optionsenv/bin/python -u masterfile.py \
     --shard $SHARD \
-    --shards 4 \
+    --shards 8 \
     --run_id "$RUN_ID" \
     --client_id $CLIENT_ID \
     >> "$LOGDIR/data_${SHARD}.log" 2>&1 &
