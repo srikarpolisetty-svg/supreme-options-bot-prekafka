@@ -76,6 +76,10 @@ class App(EWrapper, EClient):
         self._pending_snapshot = {}
         self._req_errors = {}
 
+    def tickSnapshotEnd(self, reqId: int):
+        ev = self._pending_snapshot.get(reqId)
+        if ev:
+            ev.set()
 
     def start_symbol(self, symbol: str):
         self.reset_for_symbol(symbol)
@@ -159,6 +163,51 @@ class App(EWrapper, EClient):
         if done_event:
             if ("bid" in q and "ask" in q) or ("last" in q):
                 done_event.set()
+    def get_option_quotes_ibkr_batch(self, opt_contracts, timeout: float = 1.2):
+        # 1) send all snapshot requests immediately
+        reqIds = []
+        for con in opt_contracts:
+            rid = self.request_market_data(con, snapshot=True)
+            reqIds.append(rid)
+
+        # 2) wait once (bounded)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(self._pending_snapshot[rid].is_set() for rid in reqIds):
+                break
+            time.sleep(0.01)
+
+        # 3) finalize quotes
+        out = {}
+        for con in opt_contracts:
+            conId = con.conId
+            q = dict(self.quote_by_conid.get(conId, {}))
+
+            # normalize IB sentinels → None
+            for k in ("bid", "ask", "last", "close", "iv"):
+                if q.get(k) == -1.0:
+                    q[k] = None
+
+            # sizes / counts
+            for k in ("volume", "oi", "bidSize", "askSize", "lastSize"):
+                if k not in q:
+                    q[k] = None
+
+            bid, ask = q.get("bid"), q.get("ask")
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread = ask - bid
+                spread_pct = spread / mid if mid else None
+            else:
+                mid = spread = spread_pct = None
+
+            q["mid"] = mid
+            q["spread"] = spread
+            q["spread_pct"] = spread_pct
+
+            out[conId] = q
+
+        return out
 
 
     def tickSize(self, reqId, tickType, size):
@@ -253,6 +302,52 @@ class App(EWrapper, EClient):
 
         return con
 
+    def qualify_options_batch(self, items, timeout: float = 1.2):
+        """
+        items = list of tuples: (opt_contract, right, strike, exp)
+        returns dict: (right, float(strike), exp) -> qualified Contract OR None
+        """
+
+        reqIds = []
+        keys = []
+
+        # 1) send all qualification requests immediately
+        for opt, right, strike, exp in items:
+            reqId = self._new_req_id()
+
+            key = (right, float(strike), exp)
+            self._pending_opt_qualify[reqId] = key
+            keys.append(key)
+
+            ev = threading.Event()
+            self._pending_contract_details[reqId] = ev
+
+            self.reqContractDetails(reqId, opt)
+            reqIds.append(reqId)
+
+        # 2) wait once (bounded) until all done or timeout
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(self._pending_contract_details[rid].is_set() for rid in reqIds):
+                break
+            time.sleep(0.01)
+
+        # 3) finalize results
+        out = {}
+        for rid, key in zip(reqIds, keys):
+            # cleanup event
+            self._pending_contract_details.pop(rid, None)
+
+            # if IB said no security definition, mark None
+            if rid in self._req_errors:
+                out[key] = None
+                self._pending_opt_qualify.pop(rid, None)
+                continue
+
+            # grab qualified contract if it arrived
+            out[key] = self._qualified_opt_contracts.get(key)
+
+        return out
 
 
     def get_option_quote_ibkr(self, opt_contract: Contract, timeout: float = 5.0) -> dict:
@@ -372,12 +467,25 @@ class App(EWrapper, EClient):
         opt_p2 = make_option(self.symbol, exp, p2, "P")
 
         # 5) Qualify options (get conIds)
-        qc_atm_c = self.qualify_option(opt_atm_c, "C", atm_strike, exp)
-        qc_atm_p = self.qualify_option(opt_atm_p, "P", atm_strike, exp)
-        qc_c1    = self.qualify_option(opt_c1,    "C", c1,         exp)
-        qc_p1    = self.qualify_option(opt_p1,    "P", p1,         exp)
-        qc_c2    = self.qualify_option(opt_c2,    "C", c2,         exp)
-        qc_p2    = self.qualify_option(opt_p2,    "P", p2,         exp)
+        qmap = self.qualify_options_batch(
+            [
+                (opt_atm_c, "C", atm_strike, exp),
+                (opt_atm_p, "P", atm_strike, exp),
+                (opt_c1,    "C", c1,         exp),
+                (opt_p1,    "P", p1,         exp),
+                (opt_c2,    "C", c2,         exp),
+                (opt_p2,    "P", p2,         exp),
+            ],
+            timeout=1.2
+        )
+
+        qc_atm_c = qmap.get(("C", float(atm_strike), exp))
+        qc_atm_p = qmap.get(("P", float(atm_strike), exp))
+        qc_c1    = qmap.get(("C", float(c1),         exp))
+        qc_p1    = qmap.get(("P", float(p1),         exp))
+        qc_c2    = qmap.get(("C", float(c2),         exp))
+        qc_p2    = qmap.get(("P", float(p2),         exp))
+
 
         qualified = [qc_atm_c, qc_atm_p, qc_c1, qc_p1, qc_c2, qc_p2]
 
@@ -397,14 +505,17 @@ class App(EWrapper, EClient):
         c2_con    = qc_c2
         p2_con    = qc_p2
 
+        quotes = self.get_option_quotes_ibkr_batch(
+            [atm_c_con, atm_p_con, c1_con, p1_con, c2_con, p2_con],
+            timeout=1.2
+        )
 
-        # quotes (dicts)
-        atm_c_q = self.get_option_quote_ibkr(atm_c_con, timeout=2.0)
-        atm_p_q = self.get_option_quote_ibkr(atm_p_con, timeout=2.0)
-        c1_q    = self.get_option_quote_ibkr(c1_con, timeout=2.0)
-        p1_q    = self.get_option_quote_ibkr(p1_con, timeout=2.0)
-        c2_q    = self.get_option_quote_ibkr(c2_con, timeout=2.0)
-        p2_q    = self.get_option_quote_ibkr(p2_con, timeout=2.0)
+        atm_c_q = quotes.get(atm_c_con.conId, {})
+        atm_p_q = quotes.get(atm_p_con.conId, {})
+        c1_q    = quotes.get(c1_con.conId, {})
+        p1_q    = quotes.get(p1_con.conId, {})
+        c2_q    = quotes.get(c2_con.conId, {})
+        p2_q    = quotes.get(p2_con.conId, {})
 
 
 
