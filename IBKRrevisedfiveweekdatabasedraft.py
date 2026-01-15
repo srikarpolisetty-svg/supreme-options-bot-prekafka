@@ -50,6 +50,10 @@ class App(EWrapper, EClient):
         self.quote_by_conid = {}
 
         self.reset_for_symbol(symbol)
+        self._req_errors = {}
+        self._pending_snapshot = {}
+        self._pending_contract_details = {}
+
 
     def nextValidId(self, orderId: int):
         self.reqMarketDataType(3)  # delayed-ok
@@ -96,6 +100,22 @@ class App(EWrapper, EClient):
             if meta is not None:
                 right, strike, exp = meta
                 self._qualified_opt_contracts[(right, float(strike), exp)] = con
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        print(f"ERROR {reqId} {errorCode} {errorString}")
+
+        if errorCode == 200:
+            # remember it failed
+            self._req_errors[reqId] = (errorCode, errorString)
+
+            # unblock anything waiting on this reqId
+            ev = self._pending_contract_details.get(reqId)
+            if ev:
+                ev.set()
+
+            ev = self._pending_snapshot.get(reqId)
+            if ev:
+                ev.set()
 
     def securityDefinitionOptionParameter(
         self, reqId, exchange, underlyingConId, tradingClass, multiplier, expirations, strikes
@@ -192,8 +212,35 @@ class App(EWrapper, EClient):
     
     def qualify_option(self, opt: Contract, right: str, strike: float, exp: str):
         reqId = self._new_req_id()
+
+        # track what this request is for (you already had this)
         self._pending_opt_qualify[reqId] = (right, strike, exp)
-        self.reqContractDetails(reqId, opt)   # <-- THIS is the actual qualify request
+
+        # create an Event to wait on
+        ev = threading.Event()
+        self._pending_contract_details[reqId] = ev
+
+        # send request
+        self.reqContractDetails(reqId, opt)
+
+        # wait (DO NOT hang forever)
+        ev.wait(timeout=2.0)
+
+        # ---- CRITICAL PART ----
+        # if IB said "no security definition", skip safely
+        if reqId in self._req_errors:
+            self._pending_contract_details.pop(reqId, None)
+            self._pending_opt_qualify.pop(reqId, None)
+            return None
+
+        # cleanup pending event
+        self._pending_contract_details.pop(reqId, None)
+
+        # whatever you already do to retrieve the qualified contract
+        # (example — adjust to your storage)
+        qc = self.contract_details_by_reqid.get(reqId)
+        return qc
+
 
     def get_option_quote_ibkr(self, opt_contract: Contract, timeout: float = 5.0) -> dict:
         tickerId = self.request_market_data(opt_contract, snapshot=True)
@@ -289,12 +336,19 @@ class App(EWrapper, EClient):
         opt_p2 = make_option(self.symbol, exp, p2, "P")
 
         # 5) Qualify options (get conIds)
-        self.qualify_option(opt_atm_c, "C", atm_strike, exp)
-        self.qualify_option(opt_atm_p, "P", atm_strike, exp)
-        self.qualify_option(opt_c1, "C", c1, exp)
-        self.qualify_option(opt_p1, "P", p1, exp)
-        self.qualify_option(opt_c2, "C", c2, exp)
-        self.qualify_option(opt_p2, "P", p2, exp)
+        qc_atm_c = self.qualify_option(opt_atm_c, "C", atm_strike, exp)
+        qc_atm_p = self.qualify_option(opt_atm_p, "P", atm_strike, exp)
+        qc_c1    = self.qualify_option(opt_c1,    "C", c1,         exp)
+        qc_p1    = self.qualify_option(opt_p1,    "P", p1,         exp)
+        qc_c2    = self.qualify_option(opt_c2,    "C", c2,         exp)
+        qc_p2    = self.qualify_option(opt_p2,    "P", p2,         exp)
+
+        qualified = [qc_atm_c, qc_atm_p, qc_c1, qc_p1, qc_c2, qc_p2]
+
+        # if you require all 6, skip symbol safely
+        if any(qc is None for qc in qualified):
+            return None  # caller: treat as "skip symbol"
+
 
         # Give IB a moment to return contractDetails (or you can wait loop)
         deadline = time.time() + 10.0
