@@ -7,7 +7,7 @@ LOGDIR="/home/ubuntu/supreme-options-bot-prekafka/logs"
 mkdir -p "$LOGDIR"
 
 # 🔴 WRAPPER LOG: capture EVERYTHING (cron-safe)
-exec >> "$LOGDIR/cron_5w_wrapper.log" 2>&1
+exec >> "$LOGDIR/cronwrapper.log" 2>&1
 set -x
 echo "===== CRON START $(date) ====="
 whoami
@@ -22,18 +22,17 @@ git rev-parse --short HEAD || true
 for SHARD in {0..3}; do
   CLIENT_ID=$((1000 + SHARD))
 
-  /home/ubuntu/optionsenv/bin/python -u fiveweekdatabase_masterfile.py \
+  /home/ubuntu/optionsenv/bin/python -u masterfile.py \
     --shard $SHARD \
     --shards 4 \
     --run_id "$RUN_ID" \
     --client_id $CLIENT_ID \
-    >> "$LOGDIR/5week_${SHARD}.log" 2>&1 &
+    >> "$LOGDIR/data_${SHARD}.log" 2>&1 &
 done
-
 
 wait
 
-/home/ubuntu/optionsenv/bin/python -u fiveweekdatabase_masteringest.py \
-  --run_id "$RUN_ID" >> "$LOGDIR/5week_master.log" 2>&1
+/home/ubuntu/optionsenv/bin/python -u masteringest.py \
+  --run_id "$RUN_ID" >> "$LOGDIR/masteringest.log" 2>&1
 
 echo "===== CRON END $(date) ====="

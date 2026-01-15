@@ -1,5 +1,5 @@
 from __future__ import annotations
-from IBKRrevisedfiveweekdatabasedraft import main_parquet
+from IBKRdatabase import main_parquet
 
 from databasefunctions import get_sp500_symbols
 

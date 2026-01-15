@@ -1,5 +1,4 @@
-from tenmin_database import master_ingest
-from fiveweekdatabase import master_ingest_5w
+from databasefunctions import master_ingest
 import duckdb
 import argparse
 from datetime import datetime
@@ -212,7 +211,6 @@ if __name__ == "__main__":
         # ============================================================
 
         master_ingest(run_id=args.run_id)
-        master_ingest_5w(run_id=args.run_id)
 
         # ============================================================
         # CLEANUP (ALL)
