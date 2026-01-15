@@ -310,7 +310,9 @@ class App(EWrapper, EClient):
 
         exp = self.get_friday_within_4_days()
         if exp is None:
-            raise RuntimeError("No suitable Friday expiration within 4 days found.")
+            print(f"skip {self.symbol}: no Friday expiration within 4 days")
+            return None
+
 
         atm = float(self.last_price)
 
@@ -1207,8 +1209,11 @@ def main_parquet(client_id: int, shard: int, run_id: str, symbols):
     try:
         for symbol in symbols:
             app.start_symbol(symbol)
-            app.run_sequence(run_id=run_id, shard_id=shard)
+            res = app.run_sequence(run_id=run_id, shard_id=shard)
+            if res is None:
+                continue
             time.sleep(0.3)
     finally:
         app.disconnect()
+
 
