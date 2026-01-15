@@ -223,3 +223,91 @@ def get_sp500_symbols(retries: int = 3, backoff_sec: float = 2.0, timeout_sec: f
 
     raise RuntimeError(f"Failed to fetch S&P 500 symbols and no cache found at {CACHE_PATH}.") from last_err
 
+
+
+
+
+
+
+
+
+def master_ingest(run_id: str, db_path: str = "options_data.db"):
+    """
+    Master ingest for a single options run_id.
+    Tables already exist.
+    Handles BOTH 10-min and 5-week tables.
+    """
+
+    raw_dir = f"runs/{run_id}/option_snapshots_raw"
+    enriched_dir = f"runs/{run_id}/option_snapshots_enriched"
+    signals_dir = f"runs/{run_id}/option_snapshots_execution_signals"
+
+    con = duckdb.connect(db_path)
+
+    try:
+        con.execute("BEGIN;")
+
+        # ============================
+        # 10 MIN TABLES
+        # ============================
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_execution_signals
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{signals_dir}/shard_*.parquet"],
+        )
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_enriched
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{enriched_dir}/shard_*.parquet"],
+        )
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_raw
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{raw_dir}/shard_*.parquet"],
+        )
+
+        # ============================
+        # 5 WEEK TABLES
+        # ============================
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_execution_signals_5w
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{signals_dir}/shard_*.parquet"],
+        )
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_enriched_5w
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{enriched_dir}/shard_*.parquet"],
+        )
+
+        con.execute(
+            """
+            INSERT INTO option_snapshots_raw_5w
+            SELECT * FROM read_parquet(?)
+            """,
+            [f"{raw_dir}/shard_*.parquet"],
+        )
+
+        con.execute("COMMIT;")
+
+    except Exception:
+        con.execute("ROLLBACK;")
+        raise
+
+    finally:
+        con.close()

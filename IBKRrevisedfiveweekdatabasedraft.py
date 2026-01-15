@@ -643,12 +643,16 @@ class App(EWrapper, EClient):
         ]
 
 
+        # ===== Raw =====
         df1 = pd.DataFrame(rows1, columns=cols1)
 
-        out_dir = f"runs/{run_id}/option_snapshots_raw_5w"
+        out_dir = f"runs/{run_id}/option_snapshots_raw"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
         df1.to_parquet(out_path, index=False)
+
+
+
 
         atm_call_z, atm_call_vol_z, atm_call_iv_z = compute_z_scores_for_bucket_5w(
             symbol=symbol,
@@ -916,13 +920,14 @@ class App(EWrapper, EClient):
                 None,
             ],
         ]
-
+        # ===== Enriched =====
         df2 = pd.DataFrame(rows2, columns=cols2)
 
-        out_dir = f"runs/{run_id}/option_snapshots_enriched_5w"
+        out_dir = f"runs/{run_id}/option_snapshots_enriched"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
         df2.to_parquet(out_path, index=False)
+
 
         # ======================
         # EXECUTION SIGNALS (5W)
@@ -1177,13 +1182,13 @@ class App(EWrapper, EClient):
             ],
         ]
 
+        # ===== Execution Signals =====
         df3 = pd.DataFrame(rows3, columns=cols3)
 
-        out_dir = f"runs/{run_id}/option_snapshots_execution_signals_5w"
+        out_dir = f"runs/{run_id}/option_snapshots_execution_signals"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
         df3.to_parquet(out_path, index=False)
-        pass
 
 
 def open_connection(client_id: int) -> App:
