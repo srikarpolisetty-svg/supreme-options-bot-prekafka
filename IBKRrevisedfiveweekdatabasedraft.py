@@ -238,8 +238,8 @@ class App(EWrapper, EClient):
 
         # whatever you already do to retrieve the qualified contract
         # (example — adjust to your storage)
-        qc = self.contract_details_by_reqid.get(reqId)
-        return qc
+        return True
+
 
 
     def get_option_quote_ibkr(self, opt_contract: Contract, timeout: float = 5.0) -> dict:
