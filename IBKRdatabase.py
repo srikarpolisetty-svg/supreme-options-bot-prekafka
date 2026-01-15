@@ -492,12 +492,14 @@ class App(EWrapper, EClient):
         import datetime
         import pytz
 
-        est = pytz.timezone("US/Eastern")
 
+        est = pytz.timezone("US/Eastern")
         now_est = datetime.datetime.now(est)
-        timestamp = now_est.strftime("%Y-%m-%d %H:%M:%S")
+
+        timestamp = now_est.strftime("%Y-%m-%d %H:%M:%S")  # VALID TIMESTAMP
+        snapshot_id = timestamp                           # <-- DuckDB casts this
         symbol = self.symbol
-        snapshot_id = f"{self.symbol}_{timestamp}"
+
 
         exp_date = datetime.datetime.strptime(exp, "%Y%m%d").date()
         now_date = now_est.date()
