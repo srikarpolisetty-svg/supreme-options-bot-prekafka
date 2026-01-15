@@ -27,7 +27,7 @@ def main():
     symbols = sorted(get_sp500_symbols())  # stable ordering
     my_symbols = symbols[args.shard::args.shards]
 
-    print(f"[5W] Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={args.run_id})")
+    print(f"Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={args.run_id})")
 
     # ---- unique client id per shard ----
     client_id = args.client_id_base + args.shard
