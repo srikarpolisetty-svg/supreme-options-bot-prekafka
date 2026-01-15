@@ -203,12 +203,32 @@ class App(EWrapper, EClient):
         conId = opt_contract.conId
         q = dict(self.quote_by_conid.get(conId, {}))
 
+        # normalize IB "no quote" sentinels → None
+        for k in ("bid", "ask", "last", "close", "iv"):
+            if q.get(k) == -1.0:
+                q[k] = None
+
+        # sizes / counts: keep None if missing
+        for k in ("volume", "oi", "bidSize", "askSize", "lastSize"):
+            if k not in q:
+                q[k] = None
+
         bid = q.get("bid")
         ask = q.get("ask")
-        if bid is not None and ask is not None and ask > 0:
-            q["mid"] = (bid + ask) / 2.0
-            q["spread"] = ask - bid
-            q["spread_pct"] = (ask - bid) / ((ask + bid) / 2.0) if (ask + bid) else None
+
+        # derived fields only if both sides exist and are positive
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+            spread = ask - bid
+            spread_pct = spread / mid if mid else None
+        else:
+            mid = None
+            spread = None
+            spread_pct = None
+
+        q["mid"] = mid
+        q["spread"] = spread
+        q["spread_pct"] = spread_pct
 
         return q
 
