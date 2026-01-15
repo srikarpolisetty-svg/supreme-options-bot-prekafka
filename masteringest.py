@@ -21,10 +21,10 @@ if __name__ == "__main__":
         # 10 MIN TABLES
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_raw (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -44,10 +44,10 @@ if __name__ == "__main__":
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_enriched (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -76,10 +76,10 @@ if __name__ == "__main__":
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_execution_signals (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -115,10 +115,10 @@ if __name__ == "__main__":
         # 5 WEEK TABLES
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_raw_5w (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -138,10 +138,10 @@ if __name__ == "__main__":
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_enriched_5w (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -170,10 +170,10 @@ if __name__ == "__main__":
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_execution_signals_5w (
+                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
-                option_symbol TEXT,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
