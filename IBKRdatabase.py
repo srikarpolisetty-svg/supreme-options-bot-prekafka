@@ -313,17 +313,33 @@ class App(EWrapper, EClient):
 
                 # Wait for underlying last_price (max ~10s)
         # Wait for underlying last_price (max ~10s)
-        if not self._got_underlying_price.wait(timeout=5.0):
-            # If we didn't get last, try to proceed if close came in
-            if self.last_price is None:
+        # Wait for underlying last_price (retry once, total ~5s)
+        if not self._got_underlying_price.wait(timeout=2.5):
+            # retry underlying snapshot once
+            if self.underlying_conId is not None:
+                stk = make_stock(self.symbol)
+                stk.conId = self.underlying_conId
+                self.request_market_data(stk, snapshot=True)
+
+            if not self._got_underlying_price.wait(timeout=2.5):
                 print(f"skip {self.symbol}: did not receive underlying price snapshot in time.")
                 return None
 
+        # Wait for chain (retry once, total ~8s)
+        if not self._got_chain.wait(timeout=4.0):
+            # retry chain request once
+            self.reqSecDefOptParams(
+                reqId=self._new_req_id(),
+                underlyingSymbol=self.symbol,
+                futFopExchange="",
+                underlyingSecType="STK",
+                underlyingConId=self.underlying_conId,
+            )
 
-        # Wait for chain (max ~15s)
-        if not self._got_chain.wait(timeout=8.0):
-            print(f"skip {self.symbol}: did not receive option chain in time.")
-            return None
+            if not self._got_chain.wait(timeout=4.0):
+                print(f"skip {self.symbol}: did not receive option chain in time.")
+                return None
+
 
 
         exp = self.get_friday_within_4_days()
