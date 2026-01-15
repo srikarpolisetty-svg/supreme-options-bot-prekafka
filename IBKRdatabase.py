@@ -74,6 +74,8 @@ class App(EWrapper, EClient):
         self._pending_opt_qualify = {}
         self._qualified_opt_contracts = {}
         self._pending_snapshot = {}
+        self._req_errors = {}
+
 
     def start_symbol(self, symbol: str):
         self.reset_for_symbol(symbol)
@@ -220,8 +222,9 @@ class App(EWrapper, EClient):
     def qualify_option(self, opt: Contract, right: str, strike: float, exp: str):
         reqId = self._new_req_id()
 
-        # track what this request is for (you already had this)
-        self._pending_opt_qualify[reqId] = (right, strike, exp)
+        # track what this request is for
+        key = (right, float(strike), exp)
+        self._pending_opt_qualify[reqId] = key
 
         # create an Event to wait on
         ev = threading.Event()
@@ -231,21 +234,24 @@ class App(EWrapper, EClient):
         self.reqContractDetails(reqId, opt)
 
         # wait (DO NOT hang forever)
-        ev.wait(timeout=0.6)
-
-        # ---- CRITICAL PART ----
-        # if IB said "no security definition", skip safely
-        if reqId in self._req_errors:
-            self._pending_contract_details.pop(reqId, None)
-            self._pending_opt_qualify.pop(reqId, None)
-            return None
+        ev.wait(timeout=0.8)
 
         # cleanup pending event
         self._pending_contract_details.pop(reqId, None)
 
-        # whatever you already do to retrieve the qualified contract
-        # (example — adjust to your storage)
-        return True
+        # if IB said "no security definition", skip safely
+        if reqId in self._req_errors:
+            self._pending_opt_qualify.pop(reqId, None)
+            return None
+
+        # return the qualified contract if it actually arrived
+        con = self._qualified_opt_contracts.get(key)
+        if con is None:
+            # timed out / never arrived -> treat as skip
+            self._pending_opt_qualify.pop(reqId, None)
+            return None
+
+        return con
 
 
 
@@ -367,12 +373,14 @@ class App(EWrapper, EClient):
 
         # Pull qualified contracts back out
         # qualified contracts (Contracts)
-        atm_c_con = self._qualified_opt_contracts[("C", atm_strike, exp)]
-        atm_p_con = self._qualified_opt_contracts[("P", atm_strike, exp)]
-        c1_con    = self._qualified_opt_contracts[("C", c1, exp)]
-        p1_con    = self._qualified_opt_contracts[("P", p1, exp)]
-        c2_con    = self._qualified_opt_contracts[("C", c2, exp)]
-        p2_con    = self._qualified_opt_contracts[("P", p2, exp)]
+        # Pull qualified contracts back out (use returned contracts directly)
+        atm_c_con = qc_atm_c
+        atm_p_con = qc_atm_p
+        c1_con    = qc_c1
+        p1_con    = qc_p1
+        c2_con    = qc_c2
+        p2_con    = qc_p2
+
 
         # quotes (dicts)
         atm_c_q = self.get_option_quote_ibkr(atm_c_con, timeout=2.0)
@@ -381,6 +389,10 @@ class App(EWrapper, EClient):
         p1_q    = self.get_option_quote_ibkr(p1_con, timeout=2.0)
         c2_q    = self.get_option_quote_ibkr(c2_con, timeout=2.0)
         p2_q    = self.get_option_quote_ibkr(p2_con, timeout=2.0)
+
+
+
+
 
 
         print(f"Underlying {self.symbol} last_price:", self.last_price)
@@ -485,12 +497,6 @@ class App(EWrapper, EClient):
         else:
             time_decay_bucket = "LOW"
 
-        # closest strikes
-        atm_strike = self.get_closest_strike_ibkr(atm)
-        c1 = self.get_closest_strike_ibkr(otm_call_1_target)
-        p1 = self.get_closest_strike_ibkr(otm_put_1_target)
-        c2 = self.get_closest_strike_ibkr(otm_call_2_target)
-        p2 = self.get_closest_strike_ibkr(otm_put_2_target)
   
         cols1 = [
             "con_id",
@@ -1204,16 +1210,20 @@ def open_connection(client_id: int) -> App:
 
 
 
+
 def main_parquet(client_id: int, shard: int, run_id: str, symbols):
     app = open_connection(client_id)
     try:
         for symbol in symbols:
-            app.start_symbol(symbol)
-            res = app.run_sequence(run_id=run_id, shard_id=shard)
-            if res is None:
+            try:
+                app.start_symbol(symbol)
+                res = app.run_sequence(run_id=run_id, shard_id=shard)
+                if res is None:
+                    continue
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"[SHARD {shard}] skip {symbol}: {e}", flush=True)
                 continue
-            time.sleep(0.3)
     finally:
         app.disconnect()
-
 
