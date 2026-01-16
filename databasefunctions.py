@@ -235,7 +235,11 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
     Tables already exist.
     Single-DB version (no *_5w tables).
     Safely skips ingestion when a shard glob matches zero files.
+    Uses union_by_name=True to avoid Parquet schema mismatch (NULL vs DOUBLE).
     """
+
+    import glob
+    import duckdb
 
     raw_dir = f"runs/{run_id}/option_snapshots_raw"
     enriched_dir = f"runs/{run_id}/option_snapshots_enriched"
@@ -248,10 +252,11 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
         if not files:
             print(f"[master_ingest] skip {table}: no files for {pattern}")
             return
+
         con.execute(
             f"""
             INSERT INTO {table}
-            SELECT * FROM read_parquet(?)
+            SELECT * FROM read_parquet(?, union_by_name=True)
             """,
             [pattern],
         )
@@ -285,6 +290,7 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
 
     finally:
         con.close()
+
 
 
 
