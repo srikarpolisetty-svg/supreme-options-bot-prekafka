@@ -59,9 +59,11 @@ def get_closest_strike(chain, call_put, target):
 
 import duckdb
 
+
+
 DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
 
-def compute_z_scores_for_bucket(
+def compute_dual_z_scores_for_bucket(
     symbol: str,
     bucket: str,
     call_put: str,
@@ -71,40 +73,59 @@ def compute_z_scores_for_bucket(
     current_iv: float,
 ):
     """
-    Compute z-scores for mid, volume, iv for a given
-    (symbol, bucket, call_put, time_decay_bucket),
-    using the historical rows in option_snapshots_raw.
+    Compute BOTH 3-day and 35-day (5w) z-scores for mid, volume, iv
+    from option_snapshots_raw.
     """
+
     with duckdb.connect(DB_PATH, read_only=True) as con:
         df = con.execute(
             """
-            SELECT mid, volume, iv
+            SELECT
+                mid,
+                volume,
+                iv,
+                timestamp
             FROM option_snapshots_raw
             WHERE symbol = ?
               AND moneyness_bucket = ?
               AND call_put = ?
               AND time_decay_bucket = ?
+              AND timestamp >= CURRENT_TIMESTAMP - INTERVAL 35 DAY
             """,
             [symbol, bucket, call_put, time_decay_bucket],
         ).df()
 
     if df.empty:
-        return 0.0, 0.0, 0.0
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    mid_mean = df["mid"].mean()
-    mid_std  = df["mid"].std()
+    # --------------------
+    # 3-day window
+    # --------------------
+    df_3d = df[df["timestamp"] >= df["timestamp"].max() - pd.Timedelta(days=3)]
 
-    vol_mean = df["volume"].mean()
-    vol_std  = df["volume"].std()
+    def z(x, mean, std):
+        return (x - mean) / std if std and std > 0 else 0.0
 
-    iv_mean  = df["iv"].mean()
-    iv_std   = df["iv"].std()
+    mid_z_3d = z(current_mid, df_3d["mid"].mean(), df_3d["mid"].std())
+    vol_z_3d = z(current_volume, df_3d["volume"].mean(), df_3d["volume"].std())
+    iv_z_3d  = z(current_iv, df_3d["iv"].mean(), df_3d["iv"].std())
 
-    mid_z = (current_mid - mid_mean) / mid_std if mid_std else 0.0
-    vol_z = (current_volume - vol_mean) / vol_std if vol_std else 0.0
-    iv_z  = (current_iv - iv_mean) / iv_std if iv_std else 0.0
+    # --------------------
+    # 35-day (5w) window
+    # --------------------
+    mid_z_5w = z(current_mid, df["mid"].mean(), df["mid"].std())
+    vol_z_5w = z(current_volume, df["volume"].mean(), df["volume"].std())
+    iv_z_5w  = z(current_iv, df["iv"].mean(), df["iv"].std())
 
-    return mid_z, vol_z, iv_z
+    return (
+        mid_z_3d,
+        vol_z_3d,
+        iv_z_3d,
+        mid_z_5w,
+        vol_z_5w,
+        iv_z_5w,
+    )
+
 
 
 
