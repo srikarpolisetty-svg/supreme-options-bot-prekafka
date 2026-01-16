@@ -58,8 +58,7 @@ def get_closest_strike(chain, call_put, target):
 
 
 import duckdb
-
-
+import pandas as pd
 
 DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
 
@@ -68,13 +67,17 @@ def compute_z_scores_for_bucket(
     bucket: str,
     call_put: str,
     time_decay_bucket: str,
-    current_mid: float,
-    current_volume: float,
-    current_iv: float,
+    current_mid,
+    current_volume,
+    current_iv,
 ):
     """
     Compute BOTH 3-day and 35-day (5w) z-scores for mid, volume, iv
     from option_snapshots_raw.
+
+    Returns:
+        (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
+        where any element can be None if we can't compute it safely.
     """
 
     with duckdb.connect(DB_PATH, read_only=True) as con:
@@ -96,35 +99,55 @@ def compute_z_scores_for_bucket(
         ).df()
 
     if df.empty:
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return (None, None, None, None, None, None)
+
+    # Make sure timestamp is datetime
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    # Helper: safe z
+    def z(curr, series: pd.Series):
+        if curr is None:
+            return None
+
+        s = series.dropna()
+        if s.empty:
+            return None
+
+        mean = s.mean()
+        std  = s.std()
+
+        if std is None or pd.isna(std) or std <= 0:
+            return None
+
+        # ensure curr is numeric
+        try:
+            curr_val = float(curr)
+        except Exception:
+            return None
+
+        return (curr_val - mean) / std
 
     # --------------------
     # 3-day window
     # --------------------
-    df_3d = df[df["timestamp"] >= df["timestamp"].max() - pd.Timedelta(days=3)]
+    tmax = df["timestamp"].max()
+    if pd.isna(tmax):
+        df_3d = df.iloc[0:0]
+    else:
+        df_3d = df[df["timestamp"] >= (tmax - pd.Timedelta(days=3))]
 
-    def z(x, mean, std):
-        return (x - mean) / std if std and std > 0 else 0.0
-
-    mid_z_3d = z(current_mid, df_3d["mid"].mean(), df_3d["mid"].std())
-    vol_z_3d = z(current_volume, df_3d["volume"].mean(), df_3d["volume"].std())
-    iv_z_3d  = z(current_iv, df_3d["iv"].mean(), df_3d["iv"].std())
+    mid_z_3d = z(current_mid,    df_3d["mid"])
+    vol_z_3d = z(current_volume, df_3d["volume"])
+    iv_z_3d  = z(current_iv,     df_3d["iv"])
 
     # --------------------
-    # 35-day (5w) window
+    # 35-day window
     # --------------------
-    mid_z_5w = z(current_mid, df["mid"].mean(), df["mid"].std())
-    vol_z_5w = z(current_volume, df["volume"].mean(), df["volume"].std())
-    iv_z_5w  = z(current_iv, df["iv"].mean(), df["iv"].std())
+    mid_z_35d = z(current_mid,    df["mid"])
+    vol_z_35d = z(current_volume, df["volume"])
+    iv_z_35d  = z(current_iv,     df["iv"])
 
-    return (
-        mid_z_3d,
-        vol_z_3d,
-        iv_z_3d,
-        mid_z_5w,
-        vol_z_5w,
-        iv_z_5w,
-    )
+    return (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
 
 
 

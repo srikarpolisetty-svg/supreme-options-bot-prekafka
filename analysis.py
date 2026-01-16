@@ -50,6 +50,18 @@ def run_option_signals(symbol: str):
           - f"{bucket.lower()}_call_signal"  (e.g. atm_call_signal)
           - f"{bucket.lower()}_put_signal"   (e.g. atm_put_signal)
         """
+
+        def gt(x, thr=1.5):
+            # True only for real numbers > thr (handles None / NaN / pd.NA safely)
+            try:
+                if x is None:
+                    return False
+                if x != x:  # NaN check
+                    return False
+                return x > thr
+            except Exception:
+                return False
+
         call_key = f"{bucket}_CALL"
         put_key  = f"{bucket}_PUT"
 
@@ -61,22 +73,22 @@ def run_option_signals(symbol: str):
 
         if call_m is not None:
             call_signal = (
-                call_m["z_price_5w"]  > 1.5 and
-                call_m["z_volume_5w"] > 1.5 and
-                call_m["z_iv_5w"]     > 1.5 and
-                call_m["z_price_3d"]  > 1.5 and
-                call_m["z_volume_3d"] > 1.5 and
-                call_m["z_iv_3d"]     > 1.5
+                gt(call_m.get("z_price_5w")) and
+                gt(call_m.get("z_volume_5w")) and
+                gt(call_m.get("z_iv_5w")) and
+                gt(call_m.get("z_price_3d")) and
+                gt(call_m.get("z_volume_3d")) and
+                gt(call_m.get("z_iv_3d"))
             )
 
         if put_m is not None:
             put_signal = (
-                put_m["z_price_5w"]  > 1.5 and
-                put_m["z_volume_5w"] > 1.5 and
-                put_m["z_iv_5w"]     > 1.5 and
-                put_m["z_price_3d"]  > 1.5 and
-                put_m["z_volume_3d"] > 1.5 and
-                put_m["z_iv_3d"]     > 1.5
+                gt(put_m.get("z_price_5w")) and
+                gt(put_m.get("z_volume_5w")) and
+                gt(put_m.get("z_iv_5w")) and
+                gt(put_m.get("z_price_3d")) and
+                gt(put_m.get("z_volume_3d")) and
+                gt(put_m.get("z_iv_3d"))
             )
 
         # Decision
