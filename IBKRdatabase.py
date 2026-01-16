@@ -99,6 +99,10 @@ class App(EWrapper, EClient):
                 underlyingSecType="STK",
                 underlyingConId=self.underlying_conId,
             )
+
+            ev = self._pending_contract_details.get(reqId)
+            if ev:
+                ev.set()
             return
 
         if con.secType == "OPT":
@@ -106,6 +110,12 @@ class App(EWrapper, EClient):
             if meta is not None:
                 right, strike, exp = meta
                 self._qualified_opt_contracts[(right, float(strike), exp)] = con
+
+            ev = self._pending_contract_details.get(reqId)
+            if ev:
+                ev.set()
+
+
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         print(f"ERROR {reqId} {errorCode} {errorString}")
