@@ -262,3 +262,32 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
 
     finally:
         con.close()
+
+
+
+import pandas as pd
+
+NUMERIC_COLS = [
+    "bid", "ask", "mid", "iv", "spread", "spread_pct",
+    "strike",
+    # add any other numeric columns you have
+]
+
+INT_COLS = [
+    "volume", "open_interest", "bidSize", "askSize", "lastSize",
+    # add any other integer-ish columns
+]
+
+def stabilize_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for c in NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+
+    for c in INT_COLS:
+        if c in df.columns:
+            # keep as nullable int if you want None support
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    return df

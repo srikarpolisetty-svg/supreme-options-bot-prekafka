@@ -10,7 +10,7 @@ import pytz
 import duckdb
 from ibapi.contract import Contract as IBContract
 from databasefunctions import compute_z_scores_for_bucket
-
+from databasefunctions import stabilize_schema
 HOST, PORT = "127.0.0.1", 4002
 
 
@@ -779,7 +779,7 @@ class App(EWrapper, EClient):
 
         # ===== Raw =====
         df1 = pd.DataFrame(rows1, columns=cols1)
-
+        df1 = stabilize_schema(df1) 
         out_dir = f"runs/{run_id}/option_snapshots_raw"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
@@ -1149,7 +1149,7 @@ class App(EWrapper, EClient):
 
         # ===== Enriched =====
         df2 = pd.DataFrame(rows2, columns=cols2)
-
+        df2 = stabilize_schema(df2) 
         out_dir = f"runs/{run_id}/option_snapshots_enriched"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
@@ -1464,7 +1464,7 @@ class App(EWrapper, EClient):
   
         # ===== Execution Signals =====
         df3 = pd.DataFrame(rows3, columns=cols3)
-
+        df3 = stabilize_schema(df3) 
         out_dir = f"runs/{run_id}/option_snapshots_execution_signals"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
