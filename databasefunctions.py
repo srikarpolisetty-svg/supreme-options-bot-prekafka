@@ -63,7 +63,7 @@ import duckdb
 
 DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
 
-def compute_dual_z_scores_for_bucket(
+def compute_z_scores_for_bucket(
     symbol: str,
     bucket: str,
     call_put: str,
