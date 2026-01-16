@@ -62,9 +62,17 @@ if __name__ == "__main__":
                 spread DOUBLE,
                 spread_pct DOUBLE,
                 time_decay_bucket TEXT,
-                mid_z DOUBLE,
-                volume_z DOUBLE,
-                iv_z DOUBLE,
+
+                -- 3D z-scores
+                mid_z_3d DOUBLE,
+                volume_z_3d DOUBLE,
+                iv_z_3d DOUBLE,
+
+                -- 5W z-scores
+                mid_z_5w DOUBLE,
+                volume_z_5w DOUBLE,
+                iv_z_5w DOUBLE,
+
                 opt_ret_10m DOUBLE,
                 opt_ret_1h DOUBLE,
                 opt_ret_eod DOUBLE,
@@ -94,109 +102,24 @@ if __name__ == "__main__":
                 spread DOUBLE,
                 spread_pct DOUBLE,
                 time_decay_bucket TEXT,
-                mid_z DOUBLE,
-                volume_z DOUBLE,
-                iv_z DOUBLE,
+
+                -- 3D z-scores
+                mid_z_3d DOUBLE,
+                volume_z_3d DOUBLE,
+                iv_z_3d DOUBLE,
+
+                -- 5W z-scores
+                mid_z_5w DOUBLE,
+                volume_z_5w DOUBLE,
+                iv_z_5w DOUBLE,
+
                 opt_ret_10m DOUBLE,
                 opt_ret_1h DOUBLE,
                 opt_ret_eod DOUBLE,
                 opt_ret_next_open DOUBLE,
                 opt_ret_1d DOUBLE,
                 opt_ret_exp DOUBLE,
-                atm_call_signal BOOLEAN,
-                atm_put_signal BOOLEAN,
-                otm1_call_signal BOOLEAN,
-                otm1_put_signal BOOLEAN,
-                otm2_call_signal BOOLEAN,
-                otm2_put_signal BOOLEAN
-            );
-        """)
 
-        # 5 WEEK TABLES
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS option_snapshots_raw_5w (
-                con_id BIGINT,
-                snapshot_id TEXT,
-                timestamp TIMESTAMP,
-                symbol TEXT,
-                strike DOUBLE,
-                call_put TEXT,
-                days_to_expiry INTEGER,
-                expiration_date DATE,
-                moneyness_bucket TEXT,
-                bid DOUBLE,
-                ask DOUBLE,
-                mid DOUBLE,
-                volume INTEGER,
-                open_interest INTEGER,
-                iv DOUBLE,
-                spread DOUBLE,
-                spread_pct DOUBLE,
-                time_decay_bucket TEXT
-            );
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS option_snapshots_enriched_5w (
-                con_id BIGINT,
-                snapshot_id TEXT,
-                timestamp TIMESTAMP,
-                symbol TEXT,
-                strike DOUBLE,
-                call_put TEXT,
-                days_to_expiry INTEGER,
-                expiration_date DATE,
-                moneyness_bucket TEXT,
-                bid DOUBLE,
-                ask DOUBLE,
-                mid DOUBLE,
-                volume INTEGER,
-                open_interest INTEGER,
-                iv DOUBLE,
-                spread DOUBLE,
-                spread_pct DOUBLE,
-                time_decay_bucket TEXT,
-                mid_z DOUBLE,
-                volume_z DOUBLE,
-                iv_z DOUBLE,
-                opt_ret_10m DOUBLE,
-                opt_ret_1h DOUBLE,
-                opt_ret_eod DOUBLE,
-                opt_ret_next_open DOUBLE,
-                opt_ret_1d DOUBLE,
-                opt_ret_exp DOUBLE
-            );
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS option_snapshots_execution_signals_5w (
-                con_id BIGINT,
-                snapshot_id TEXT,
-                timestamp TIMESTAMP,
-                symbol TEXT,
-                strike DOUBLE,
-                call_put TEXT,
-                days_to_expiry INTEGER,
-                expiration_date DATE,
-                moneyness_bucket TEXT,
-                bid DOUBLE,
-                ask DOUBLE,
-                mid DOUBLE,
-                volume INTEGER,
-                open_interest INTEGER,
-                iv DOUBLE,
-                spread DOUBLE,
-                spread_pct DOUBLE,
-                time_decay_bucket TEXT,
-                mid_z DOUBLE,
-                volume_z DOUBLE,
-                iv_z DOUBLE,
-                opt_ret_10m DOUBLE,
-                opt_ret_1h DOUBLE,
-                opt_ret_eod DOUBLE,
-                opt_ret_next_open DOUBLE,
-                opt_ret_1d DOUBLE,
-                opt_ret_exp DOUBLE,
                 atm_call_signal BOOLEAN,
                 atm_put_signal BOOLEAN,
                 otm1_call_signal BOOLEAN,
@@ -216,34 +139,19 @@ if __name__ == "__main__":
         # CLEANUP (ALL)
         # ============================================================
 
-        # 10 MIN CLEANUP
+        # KEEP 35 DAYS OF DATA (single-table strategy)
         con.execute("""
             DELETE FROM option_snapshots_raw
-            WHERE timestamp < NOW() - INTERVAL '3 days';
+            WHERE timestamp < NOW() - INTERVAL '35 days';
         """)
 
         con.execute("""
             DELETE FROM option_snapshots_enriched
-            WHERE timestamp < NOW() - INTERVAL '3 days';
+            WHERE timestamp < NOW() - INTERVAL '35 days';
         """)
 
         con.execute("""
             DELETE FROM option_snapshots_execution_signals
-            WHERE timestamp < NOW() - INTERVAL '3 days';
-        """)
-
-        # 5 WEEK CLEANUP
-        con.execute("""
-            DELETE FROM option_snapshots_raw_5w
             WHERE timestamp < NOW() - INTERVAL '35 days';
         """)
 
-        con.execute("""
-            DELETE FROM option_snapshots_enriched_5w
-            WHERE timestamp < NOW() - INTERVAL '35 days';
-        """)
-
-        con.execute("""
-            DELETE FROM option_snapshots_execution_signals_5w
-            WHERE timestamp < NOW() - INTERVAL '35 days';
-        """)

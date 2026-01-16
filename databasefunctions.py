@@ -59,7 +59,7 @@ def get_closest_strike(chain, call_put, target):
 
 import duckdb
 
-DB_PATH = "/home/ubuntu/supreme-options-bot/options_data.db"
+DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
 
 def compute_z_scores_for_bucket(
     symbol: str,
@@ -80,56 +80,6 @@ def compute_z_scores_for_bucket(
             """
             SELECT mid, volume, iv
             FROM option_snapshots_raw
-            WHERE symbol = ?
-              AND moneyness_bucket = ?
-              AND call_put = ?
-              AND time_decay_bucket = ?
-            """,
-            [symbol, bucket, call_put, time_decay_bucket],
-        ).df()
-
-    if df.empty:
-        return 0.0, 0.0, 0.0
-
-    mid_mean = df["mid"].mean()
-    mid_std  = df["mid"].std()
-
-    vol_mean = df["volume"].mean()
-    vol_std  = df["volume"].std()
-
-    iv_mean  = df["iv"].mean()
-    iv_std   = df["iv"].std()
-
-    mid_z = (current_mid - mid_mean) / mid_std if mid_std else 0.0
-    vol_z = (current_volume - vol_mean) / vol_std if vol_std else 0.0
-    iv_z  = (current_iv - iv_mean) / iv_std if iv_std else 0.0
-
-    return mid_z, vol_z, iv_z
-
-
-
-
-
-
-
-import duckdb
-
-DB_PATH = "/home/ubuntu/supreme-options-bot/options_data.db"
-
-def compute_z_scores_for_bucket_5w(
-    symbol: str,
-    bucket: str,
-    call_put: str,
-    time_decay_bucket: str,
-    current_mid: float,
-    current_volume: float,
-    current_iv: float,
-):
-    with duckdb.connect(DB_PATH, read_only=True) as con:
-        df = con.execute(
-            """
-            SELECT mid, volume, iv
-            FROM option_snapshots_raw_5w
             WHERE symbol = ?
               AND moneyness_bucket = ?
               AND call_put = ?

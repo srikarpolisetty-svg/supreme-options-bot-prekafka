@@ -18,21 +18,10 @@ def get_latest_snapshot(
         ORDER BY snapshot_id DESC
         LIMIT 1
     """
-    return con.execute(
-        query,
-        [symbol, call_put, moneyness_bucket]
-    ).df()
+    return con.execute(query, [symbol, call_put, moneyness_bucket]).df()
 
 
-
-
-
-def load_all_groups(con, symbol: str):
-    tables = {
-        "short": "option_snapshots_enriched",
-        "long":  "option_snapshots_enriched_5w"
-    }
-
+def load_all_groups(con, symbol: str, table: str = "option_snapshots_enriched"):
     buckets = ["ATM", "OTM_1", "OTM_2"]
     sides = ["C", "P"]
 
@@ -43,34 +32,16 @@ def load_all_groups(con, symbol: str):
             key = f"{bucket}_{'CALL' if side=='C' else 'PUT'}"
 
             try:
-                short_df = get_latest_snapshot(con, tables["short"], symbol, side, bucket)
+                df = get_latest_snapshot(con, table, symbol, side, bucket)
             except Exception:
-                short_df = None
+                df = None
 
-            try:
-                long_df = get_latest_snapshot(con, tables["long"], symbol, side, bucket)
-            except Exception:
-                long_df = None
+            if df is not None and df.empty:
+                df = None
 
-            # Normalize empty → None
-            if short_df is not None and short_df.empty:
-                short_df = None
-            if long_df is not None and long_df.empty:
-                long_df = None
-
-            data[key] = {
-                "short": short_df,
-                "long":  long_df
-            }
+            data[key] = df
 
     return data
-
-
-
-
-
-
-
 
 
 def get_option_metrics(groups, key: str):
@@ -82,70 +53,44 @@ def get_option_metrics(groups, key: str):
     if key not in groups:
         return None
 
-    short_df = groups[key].get("short")
-    long_df  = groups[key].get("long")
-
-    if short_df is None or short_df.empty:
+    df = groups[key]
+    if df is None or df.empty:
         return None
 
-    if long_df is None or long_df.empty:
-        return None
-
-    short_row = short_df.iloc[0]
-    long_row  = long_df.iloc[0]
+    row = df.iloc[0]
 
     return {
-        "short": {
-            "z_price":     short_row["mid_z"],
-            "z_volume":    short_row["volume_z"],
-            "z_iv":        short_row["iv_z"],
-            "strike":      short_row["strike"],
-            "price":       short_row["mid"],
-            "symbol":      short_row["symbol"],
-            "snapshot_id": short_row["snapshot_id"],
-        },
-        "long": {
-            "z_price":     long_row["mid_z"],
-            "z_volume":    long_row["volume_z"],
-            "z_iv":        long_row["iv_z"],
-            "snapshot_id": long_row["snapshot_id"],
-        }
+        "z_price_3d":   row.get("mid_z_3d"),
+        "z_volume_3d":  row.get("volume_z_3d"),
+        "z_iv_3d":      row.get("iv_z_3d"),
+
+        "z_price_5w":   row.get("mid_z_5w"),
+        "z_volume_5w":  row.get("volume_z_5w"),
+        "z_iv_5w":      row.get("iv_z_5w"),
+
+        "strike":       row.get("strike"),
+        "price":        row.get("mid"),
+        "symbol":       row.get("symbol"),
+        "snapshot_id":  row.get("snapshot_id"),
+        "call_put":     row.get("call_put"),
+        "bucket":       row.get("moneyness_bucket"),
     }
-
-
-
-
-
-
-
 
 
 def update_signal(
     con,
     symbol: str,
-    short_snapshot_id,
-    long_snapshot_id,
+    snapshot_id,
     call_put,
     bucket,
     signal_column,
+    table: str = "option_snapshots_execution_signals",
 ):
-    # Update short-term table
     con.execute(f"""
-        UPDATE option_snapshots_execution_signals
+        UPDATE {table}
         SET {signal_column} = TRUE
         WHERE snapshot_id = ?
           AND symbol = ?
           AND call_put = ?
           AND moneyness_bucket = ?;
-    """, [short_snapshot_id, symbol, call_put, bucket])
-
-    # Update long-term table
-    con.execute(f"""
-        UPDATE option_snapshots_execution_signals_5w
-        SET {signal_column} = TRUE
-        WHERE snapshot_id = ?
-          AND symbol = ?
-          AND call_put = ?
-          AND moneyness_bucket = ?;
-    """, [long_snapshot_id, symbol, call_put, bucket])
-
+    """, [snapshot_id, symbol, call_put, bucket])

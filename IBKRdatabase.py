@@ -9,7 +9,7 @@ import os
 import pytz
 import duckdb
 from ibapi.contract import Contract as IBContract
-from databasefunctions import compute_z_scores_for_bucket_5w
+from databasefunctions import compute_z_scores_for_bucket
 
 HOST, PORT = "127.0.0.1", 4002
 
@@ -788,7 +788,14 @@ class App(EWrapper, EClient):
 
 
 
-        atm_call_z, atm_call_vol_z, atm_call_iv_z = compute_z_scores_for_bucket_5w(
+        (
+            atm_call_mid_z_3d,
+            atm_call_vol_z_3d,
+            atm_call_iv_z_3d,
+            atm_call_mid_z_5w,
+            atm_call_vol_z_5w,
+            atm_call_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="ATM",
             call_put="C",
@@ -797,7 +804,15 @@ class App(EWrapper, EClient):
             current_volume=atm_call_volume,
             current_iv=atm_call_iv,
         )
-        atm_put_z, atm_put_vol_z, atm_put_iv_z = compute_z_scores_for_bucket_5w(
+
+        (
+            atm_put_mid_z_3d,
+            atm_put_vol_z_3d,
+            atm_put_iv_z_3d,
+            atm_put_mid_z_5w,
+            atm_put_vol_z_5w,
+            atm_put_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="ATM",
             call_put="P",
@@ -806,7 +821,15 @@ class App(EWrapper, EClient):
             current_volume=atm_put_volume,
             current_iv=atm_put_iv,
         )
-        otm_call_1_z, otm_call_1_vol_z, otm_call_1_iv_z = compute_z_scores_for_bucket_5w(
+
+        (
+            otm_call_1_mid_z_3d,
+            otm_call_1_vol_z_3d,
+            otm_call_1_iv_z_3d,
+            otm_call_1_mid_z_5w,
+            otm_call_1_vol_z_5w,
+            otm_call_1_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="OTM_1",
             call_put="C",
@@ -815,7 +838,15 @@ class App(EWrapper, EClient):
             current_volume=otm_call_1_volume,
             current_iv=otm_call_1_iv,
         )
-        otm_put_1_z, otm_put_1_vol_z, otm_put_1_iv_z = compute_z_scores_for_bucket_5w(
+
+        (
+            otm_put_1_mid_z_3d,
+            otm_put_1_vol_z_3d,
+            otm_put_1_iv_z_3d,
+            otm_put_1_mid_z_5w,
+            otm_put_1_vol_z_5w,
+            otm_put_1_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="OTM_1",
             call_put="P",
@@ -824,7 +855,15 @@ class App(EWrapper, EClient):
             current_volume=otm_put_1_volume,
             current_iv=otm_put_1_iv,
         )
-        otm_call_2_z, otm_call_2_vol_z, otm_call_2_iv_z = compute_z_scores_for_bucket_5w(
+
+        (
+            otm_call_2_mid_z_3d,
+            otm_call_2_vol_z_3d,
+            otm_call_2_iv_z_3d,
+            otm_call_2_mid_z_5w,
+            otm_call_2_vol_z_5w,
+            otm_call_2_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="OTM_2",
             call_put="C",
@@ -833,7 +872,15 @@ class App(EWrapper, EClient):
             current_volume=otm_call_2_volume,
             current_iv=otm_call_2_iv,
         )
-        otm_put_2_z, otm_put_2_vol_z, otm_put_2_iv_z = compute_z_scores_for_bucket_5w(
+
+        (
+            otm_put_2_mid_z_3d,
+            otm_put_2_vol_z_3d,
+            otm_put_2_iv_z_3d,
+            otm_put_2_mid_z_5w,
+            otm_put_2_vol_z_5w,
+            otm_put_2_iv_z_5w,
+        ) = compute_z_scores_for_bucket(
             symbol=symbol,
             bucket="OTM_2",
             call_put="P",
@@ -842,6 +889,7 @@ class App(EWrapper, EClient):
             current_volume=otm_put_2_volume,
             current_iv=otm_put_2_iv,
         )
+
 
         # ======================
         # ENRICHED (5W)
@@ -867,9 +915,17 @@ class App(EWrapper, EClient):
             "spread",
             "spread_pct",
             "time_decay_bucket",
-            "mid_z",
-            "volume_z",
-            "iv_z",
+
+            # 3D z-scores
+            "mid_z_3d",
+            "volume_z_3d",
+            "iv_z_3d",
+
+            # 5W z-scores
+            "mid_z_5w",
+            "volume_z_5w",
+            "iv_z_5w",
+
             "opt_ret_10m",
             "opt_ret_1h",
             "opt_ret_eod",
@@ -898,9 +954,15 @@ class App(EWrapper, EClient):
                 atm_call_spread,
                 atm_call_spread_pct,
                 time_decay_bucket,
-                atm_call_z,
-                atm_call_vol_z,
-                atm_call_iv_z,
+
+                atm_call_mid_z_3d,
+                atm_call_vol_z_3d,
+                atm_call_iv_z_3d,
+
+                atm_call_mid_z_5w,
+                atm_call_vol_z_5w,
+                atm_call_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -927,9 +989,15 @@ class App(EWrapper, EClient):
                 atm_put_spread,
                 atm_put_spread_pct,
                 time_decay_bucket,
-                atm_put_z,
-                atm_put_vol_z,
-                atm_put_iv_z,
+
+                atm_put_mid_z_3d,
+                atm_put_vol_z_3d,
+                atm_put_iv_z_3d,
+
+                atm_put_mid_z_5w,
+                atm_put_vol_z_5w,
+                atm_put_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -956,9 +1024,15 @@ class App(EWrapper, EClient):
                 otm_call_1_spread,
                 otm_call_1_spread_pct,
                 time_decay_bucket,
-                otm_call_1_z,
-                otm_call_1_vol_z,
-                otm_call_1_iv_z,
+
+                otm_call_1_mid_z_3d,
+                otm_call_1_vol_z_3d,
+                otm_call_1_iv_z_3d,
+
+                otm_call_1_mid_z_5w,
+                otm_call_1_vol_z_5w,
+                otm_call_1_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -985,9 +1059,15 @@ class App(EWrapper, EClient):
                 otm_put_1_spread,
                 otm_put_1_spread_pct,
                 time_decay_bucket,
-                otm_put_1_z,
-                otm_put_1_vol_z,
-                otm_put_1_iv_z,
+
+                otm_put_1_mid_z_3d,
+                otm_put_1_vol_z_3d,
+                otm_put_1_iv_z_3d,
+
+                otm_put_1_mid_z_5w,
+                otm_put_1_vol_z_5w,
+                otm_put_1_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -1014,9 +1094,15 @@ class App(EWrapper, EClient):
                 otm_call_2_spread,
                 otm_call_2_spread_pct,
                 time_decay_bucket,
-                otm_call_2_z,
-                otm_call_2_vol_z,
-                otm_call_2_iv_z,
+
+                otm_call_2_mid_z_3d,
+                otm_call_2_vol_z_3d,
+                otm_call_2_iv_z_3d,
+
+                otm_call_2_mid_z_5w,
+                otm_call_2_vol_z_5w,
+                otm_call_2_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -1043,9 +1129,15 @@ class App(EWrapper, EClient):
                 otm_put_2_spread,
                 otm_put_2_spread_pct,
                 time_decay_bucket,
-                otm_put_2_z,
-                otm_put_2_vol_z,
-                otm_put_2_iv_z,
+
+                otm_put_2_mid_z_3d,
+                otm_put_2_vol_z_3d,
+                otm_put_2_iv_z_3d,
+
+                otm_put_2_mid_z_5w,
+                otm_put_2_vol_z_5w,
+                otm_put_2_iv_z_5w,
+
                 None,
                 None,
                 None,
@@ -1054,6 +1146,7 @@ class App(EWrapper, EClient):
                 None,
             ],
         ]
+
         # ===== Enriched =====
         df2 = pd.DataFrame(rows2, columns=cols2)
 
@@ -1066,7 +1159,6 @@ class App(EWrapper, EClient):
         # ======================
         # EXECUTION SIGNALS (5W)
         # ======================        atm_call_conid = q_atm_c.conId
-
         cols3 = [
             "con_id",
             "snapshot_id",
@@ -1086,15 +1178,24 @@ class App(EWrapper, EClient):
             "spread",
             "spread_pct",
             "time_decay_bucket",
-            "mid_z",
-            "volume_z",
-            "iv_z",
+
+            # 3D z-scores
+            "mid_z_3d",
+            "volume_z_3d",
+            "iv_z_3d",
+
+            # 5W z-scores
+            "mid_z_5w",
+            "volume_z_5w",
+            "iv_z_5w",
+
             "opt_ret_10m",
             "opt_ret_1h",
             "opt_ret_eod",
             "opt_ret_next_open",
             "opt_ret_1d",
             "opt_ret_exp",
+
             "atm_call_signal",
             "atm_put_signal",
             "otm1_call_signal",
@@ -1102,7 +1203,7 @@ class App(EWrapper, EClient):
             "otm2_call_signal",
             "otm2_put_signal",
         ]
-        
+
         rows3 = [
             [
                 atm_call_conid,
@@ -1123,15 +1224,22 @@ class App(EWrapper, EClient):
                 atm_call_spread,
                 atm_call_spread_pct,
                 time_decay_bucket,
-                atm_call_z,
-                atm_call_vol_z,
-                atm_call_iv_z,
+
+                atm_call_mid_z_3d,
+                atm_call_vol_z_3d,
+                atm_call_iv_z_3d,
+
+                atm_call_mid_z_5w,
+                atm_call_vol_z_5w,
+                atm_call_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1158,15 +1266,22 @@ class App(EWrapper, EClient):
                 atm_put_spread,
                 atm_put_spread_pct,
                 time_decay_bucket,
-                atm_put_z,
-                atm_put_vol_z,
-                atm_put_iv_z,
+
+                atm_put_mid_z_3d,
+                atm_put_vol_z_3d,
+                atm_put_iv_z_3d,
+
+                atm_put_mid_z_5w,
+                atm_put_vol_z_5w,
+                atm_put_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1193,15 +1308,22 @@ class App(EWrapper, EClient):
                 otm_call_1_spread,
                 otm_call_1_spread_pct,
                 time_decay_bucket,
-                otm_call_1_z,
-                otm_call_1_vol_z,
-                otm_call_1_iv_z,
+
+                otm_call_1_mid_z_3d,
+                otm_call_1_vol_z_3d,
+                otm_call_1_iv_z_3d,
+
+                otm_call_1_mid_z_5w,
+                otm_call_1_vol_z_5w,
+                otm_call_1_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1228,15 +1350,22 @@ class App(EWrapper, EClient):
                 otm_put_1_spread,
                 otm_put_1_spread_pct,
                 time_decay_bucket,
-                otm_put_1_z,
-                otm_put_1_vol_z,
-                otm_put_1_iv_z,
+
+                otm_put_1_mid_z_3d,
+                otm_put_1_vol_z_3d,
+                otm_put_1_iv_z_3d,
+
+                otm_put_1_mid_z_5w,
+                otm_put_1_vol_z_5w,
+                otm_put_1_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1263,15 +1392,22 @@ class App(EWrapper, EClient):
                 otm_call_2_spread,
                 otm_call_2_spread_pct,
                 time_decay_bucket,
-                otm_call_2_z,
-                otm_call_2_vol_z,
-                otm_call_2_iv_z,
+
+                otm_call_2_mid_z_3d,
+                otm_call_2_vol_z_3d,
+                otm_call_2_iv_z_3d,
+
+                otm_call_2_mid_z_5w,
+                otm_call_2_vol_z_5w,
+                otm_call_2_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1298,15 +1434,22 @@ class App(EWrapper, EClient):
                 otm_put_2_spread,
                 otm_put_2_spread_pct,
                 time_decay_bucket,
-                otm_put_2_z,
-                otm_put_2_vol_z,
-                otm_put_2_iv_z,
+
+                otm_put_2_mid_z_3d,
+                otm_put_2_vol_z_3d,
+                otm_put_2_iv_z_3d,
+
+                otm_put_2_mid_z_5w,
+                otm_put_2_vol_z_5w,
+                otm_put_2_iv_z_5w,
+
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+
                 None,
                 None,
                 None,
@@ -1316,6 +1459,9 @@ class App(EWrapper, EClient):
             ],
         ]
 
+
+        
+  
         # ===== Execution Signals =====
         df3 = pd.DataFrame(rows3, columns=cols3)
 

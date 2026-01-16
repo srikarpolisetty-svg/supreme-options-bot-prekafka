@@ -24,311 +24,108 @@ def run_option_signals(symbol: str):
 
     con = duckdb.connect("options_data.db")
 
+    # NOTE: load_all_groups now returns { "ATM_CALL": df, "ATM_PUT": df, ... } (single table)
     groups = load_all_groups(con, symbol)
 
     if groups is None:
-     return f"no data {symbol}"
+        con.close()
+        return f"no data {symbol}"
 
-    # ===== ATM CALL =====
-    atm_call = get_option_metrics(groups, "ATM_CALL")
-    atm_call_short = atm_call["short"]
+    # =========================
+    # Helper: pull metrics safely
+    # =========================
+    def M(key: str):
+        m = get_option_metrics(groups, key)  # single-table metrics dict
+        if m is None:
+            return None
+        return m
 
-    z_price_atm_2_3day  = atm_call_short["z_price"]
-    z_volume_atm_2_3day = atm_call_short["z_volume"]
-    z_iv_atm_2_3day     = atm_call_short["z_iv"]
-    strike_atm          = atm_call_short["strike"]
-    price_atm           = atm_call_short["price"]
-    symbol_atm          = atm_call_short["symbol"]
-    snapshot_id_atmcall = atm_call_short["snapshot_id"]
+    # ============================================================
+    # ATM, OTM_1 and OTM_2 blocks are identical structure → helper
+    # ============================================================
+    def handle_bucket(bucket: str):
+        """
+        bucket: "ATM", "OTM_1", or "OTM_2"
+        Updates signal columns:
+          - f"{bucket.lower()}_call_signal"  (e.g. atm_call_signal)
+          - f"{bucket.lower()}_put_signal"   (e.g. atm_put_signal)
+        """
+        call_key = f"{bucket}_CALL"
+        put_key  = f"{bucket}_PUT"
 
-    atm_call_long = atm_call["long"]
-    z_price_atm_5w         = atm_call_long["z_price"]
-    z_volume_atm_5w        = atm_call_long["z_volume"]
-    z_iv_atm_5w            = atm_call_long["z_iv"]
-    snapshot_id_atmcall_5w = atm_call_long["snapshot_id"]
+        call_m = M(call_key)
+        put_m  = M(put_key)
 
-    atm_call_signal = (
-        z_price_atm_5w  > 1.5 and
-        z_volume_atm_5w > 1.5 and
-        z_iv_atm_5w     > 1.5 and
-        z_price_atm_2_3day  > 1.5 and
-        z_volume_atm_2_3day > 1.5 and
-        z_iv_atm_2_3day     > 1.5
-    )
+        call_signal = False
+        put_signal  = False
 
-    # ===== ATM PUT =====
-    atm_put = get_option_metrics(groups, "ATM_PUT")
-    atm_put_short = atm_put["short"]
+        if call_m is not None:
+            call_signal = (
+                call_m["z_price_5w"]  > 1.5 and
+                call_m["z_volume_5w"] > 1.5 and
+                call_m["z_iv_5w"]     > 1.5 and
+                call_m["z_price_3d"]  > 1.5 and
+                call_m["z_volume_3d"] > 1.5 and
+                call_m["z_iv_3d"]     > 1.5
+            )
 
-    z_price_atm_put_2_3day  = atm_put_short["z_price"]
-    z_volume_atm_put_2_3day = atm_put_short["z_volume"]
-    z_iv_atm_put_2_3day     = atm_put_short["z_iv"]
-    strike_atm_put          = atm_put_short["strike"]
-    price_atm_put           = atm_put_short["price"]
-    symbol_atm_put          = atm_put_short["symbol"]
-    snapshot_id_atmput      = atm_put_short["snapshot_id"]
+        if put_m is not None:
+            put_signal = (
+                put_m["z_price_5w"]  > 1.5 and
+                put_m["z_volume_5w"] > 1.5 and
+                put_m["z_iv_5w"]     > 1.5 and
+                put_m["z_price_3d"]  > 1.5 and
+                put_m["z_volume_3d"] > 1.5 and
+                put_m["z_iv_3d"]     > 1.5
+            )
 
-    atm_put_long = atm_put["long"]
-    z_price_atm_put_5w    = atm_put_long["z_price"]
-    z_volume_atm_put_5w   = atm_put_long["z_volume"]
-    z_iv_atm_put_5w       = atm_put_long["z_iv"]
-    snapshot_id_atmput_5w = atm_put_long["snapshot_id"]
+        # Decision
+        if call_signal and not put_signal and call_m is not None:
+            send_text(
+                f"🚀 STRONG {bucket} CALL SIGNAL\n\n"
+                f"Symbol: {call_m['symbol']}\n"
+                f"Strike: {call_m['strike']}\n"
+                f"Option Price (mid): {call_m['price']}\n\n"
+                f"All price/volume/IV Z-scores > 1.5 in BOTH 3-day and 5-week windows."
+            )
+            print(f"ALERT SENT ({bucket} CALL)")
 
-    atm_put_signal = (
-        z_price_atm_put_5w  > 1.5 and
-        z_volume_atm_put_5w > 1.5 and
-        z_iv_atm_put_5w     > 1.5 and
-        z_price_atm_put_2_3day  > 1.5 and
-        z_volume_atm_put_2_3day > 1.5 and
-        z_iv_atm_put_2_3day     > 1.5
-    )
+            update_signal(
+                con,
+                symbol=call_m["symbol"],
+                snapshot_id=call_m["snapshot_id"],
+                call_put="C",
+                bucket=bucket,
+                signal_column=f"{bucket.lower()}_call_signal",
+            )
 
-    # ===== DECISION LOGIC (ATM) =====
-    if atm_call_signal and not atm_put_signal:
-        send_text(
-            f"🚀 STRONG ATM CALL SIGNAL\n\n"
-            f"Symbol: {symbol_atm}\n"
-            f"Strike: {strike_atm}\n"
-            f"Option Price (mid): {price_atm}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows.\n"
-            f"Strong UPWARD pressure likely."
-        )
-        print("ALERT SENT (ATM CALL)")
+        elif put_signal and not call_signal and put_m is not None:
+            send_text(
+                f"⚠️ STRONG {bucket} PUT SIGNAL\n\n"
+                f"Symbol: {put_m['symbol']}\n"
+                f"Strike: {put_m['strike']}\n"
+                f"Option Price (mid): {put_m['price']}\n\n"
+                f"All price/volume/IV Z-scores > 1.5 in BOTH 3-day and 5-week windows."
+            )
+            print(f"ALERT SENT ({bucket} PUT)")
 
-        update_signal(
-            con,
-            symbol=symbol_atm,
-            short_snapshot_id=snapshot_id_atmcall,
-            long_snapshot_id=snapshot_id_atmcall_5w,
-            call_put="C",
-            bucket="ATM",
-            signal_column="atm_call_signal"
-        )
+            update_signal(
+                con,
+                symbol=put_m["symbol"],
+                snapshot_id=put_m["snapshot_id"],
+                call_put="P",
+                bucket=bucket,
+                signal_column=f"{bucket.lower()}_put_signal",
+            )
 
-    elif atm_put_signal and not atm_call_signal:
-        send_text(
-            f"⚠️ STRONG ATM PUT SIGNAL\n\n"
-            f"Symbol: {symbol_atm_put}\n"
-            f"Strike: {strike_atm_put}\n"
-            f"Option Price (mid): {price_atm_put}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows.\n"
-            f"Strong DOWNWARD pressure likely."
-        )
-        print("ALERT SENT (ATM PUT)")
+        elif call_signal and put_signal:
+            print(f"{bucket} CALL & PUT both elevated → volatility spike, no directional {bucket} signal.")
+        else:
+            print(f"No {bucket} directional signal. Z-scores not all > 1.5.")
 
-        update_signal(
-            con,
-            symbol=symbol_atm_put,
-            short_snapshot_id=snapshot_id_atmput,
-            long_snapshot_id=snapshot_id_atmput_5w,
-            call_put="P",
-            bucket="ATM",
-            signal_column="atm_put_signal"
-        )
-
-    elif atm_call_signal and atm_put_signal:
-        print("ATM CALL & PUT both elevated → volatility spike, no directional ATM signal.")
-    else:
-        print("No ATM directional signal. Z-scores not all > 1.5.")
-
-    # ===== OTM_1 CALL =====
-    otm1_call = get_option_metrics(groups, "OTM_1_CALL")
-    otm1_call_short = otm1_call["short"]
-
-    z_price_otm1_2_3day   = otm1_call_short["z_price"]
-    z_volume_otm1_2_3day  = otm1_call_short["z_volume"]
-    z_iv_otm1_2_3day      = otm1_call_short["z_iv"]
-    strike_otm1           = otm1_call_short["strike"]
-    price_otm1            = otm1_call_short["price"]
-    symbol_otm1           = otm1_call_short["symbol"]
-    snapshot_id_otm1_call = otm1_call_short["snapshot_id"]
-
-    otm1_call_long = otm1_call["long"]
-    z_price_otm1_5w         = otm1_call_long["z_price"]
-    z_volume_otm1_5w        = otm1_call_long["z_volume"]
-    z_iv_otm1_5w            = otm1_call_long["z_iv"]
-    snapshot_id_5w_otm1call = otm1_call_long["snapshot_id"]
-
-    otm1_call_signal = (
-        z_price_otm1_5w  > 1.5 and
-        z_volume_otm1_5w > 1.5 and
-        z_iv_otm1_5w     > 1.5 and
-        z_price_otm1_2_3day  > 1.5 and
-        z_volume_otm1_2_3day > 1.5 and
-        z_iv_otm1_2_3day     > 1.5
-    )
-
-    # ===== OTM_1 PUT =====
-    otm1_put = get_option_metrics(groups, "OTM_1_PUT")
-    otm1_put_short = otm1_put["short"]
-
-    z_price_otm1_put_2_3day  = otm1_put_short["z_price"]
-    z_volume_otm1_put_2_3day = otm1_put_short["z_volume"]
-    z_iv_otm1_put_2_3day     = otm1_put_short["z_iv"]
-    strike_otm1_put          = otm1_put_short["strike"]
-    price_otm1_put           = otm1_put_short["price"]
-    symbol_otm1_put          = otm1_put_short["symbol"]
-    snapshot_id_otm1_put2_3  = otm1_put_short["snapshot_id"]
-
-    otm1_put_long = otm1_put["long"]
-    z_price_otm1_put_5w    = otm1_put_long["z_price"]
-    z_volume_otm1_put_5w   = otm1_put_long["z_volume"]
-    z_iv_otm1_put_5w       = otm1_put_long["z_iv"]
-    snapshot_id_5w_otmput1 = otm1_put_long["snapshot_id"]
-
-    otm1_put_signal = (
-        z_price_otm1_put_5w  > 1.5 and
-        z_volume_otm1_put_5w > 1.5 and
-        z_iv_otm1_put_5w     > 1.5 and
-        z_price_otm1_put_2_3day  > 1.5 and
-        z_volume_otm1_put_2_3day > 1.5 and
-        z_iv_otm1_put_2_3day     > 1.5
-    )
-
-    # ===== OTM_1 DECISION =====
-    if otm1_call_signal and not otm1_put_signal:
-        send_text(
-            f"🚀 STRONG OTM_1 CALL SIGNAL\n\n"
-            f"Symbol: {symbol_otm1}\n"
-            f"Strike: {strike_otm1}\n"
-            f"Option Price (mid): {price_otm1}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows."
-        )
-        print("ALERT SENT (OTM_1 CALL)")
-
-        update_signal(
-            con,
-            symbol=symbol_otm1,
-            short_snapshot_id=snapshot_id_otm1_call,
-            long_snapshot_id=snapshot_id_5w_otm1call,
-            call_put="C",
-            bucket="OTM_1",
-            signal_column="otm1_call_signal"
-        )
-
-    elif otm1_put_signal and not otm1_call_signal:
-        send_text(
-            f"⚠️ STRONG OTM_1 PUT SIGNAL\n\n"
-            f"Symbol: {symbol_otm1_put}\n"
-            f"Strike: {strike_otm1_put}\n"
-            f"Option Price (mid): {price_otm1_put}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows."
-        )
-        print("ALERT SENT (OTM_1 PUT)")
-
-        update_signal(
-            con,
-            symbol=symbol_otm1_put,
-            short_snapshot_id=snapshot_id_otm1_put2_3,
-            long_snapshot_id=snapshot_id_5w_otmput1,
-            call_put="P",
-            bucket="OTM_1",
-            signal_column="otm1_put_signal"
-        )
-
-    elif otm1_call_signal and otm1_put_signal:
-        print("OTM_1 CALL & PUT both elevated → volatility spike, no directional OTM_1 signal.")
-    else:
-        print("No OTM_1 directional signal. Z-scores not all > 1.5.")
-
-    # ===== OTM_2 CALL =====
-    otm2_call = get_option_metrics(groups, "OTM_2_CALL")
-    otm2_call_short = otm2_call["short"]
-
-    z_price_otm2_2_3day  = otm2_call_short["z_price"]
-    z_volume_otm2_2_3day = otm2_call_short["z_volume"]
-    z_iv_otm2_2_3day     = otm2_call_short["z_iv"]
-    strike_otm2          = otm2_call_short["strike"]
-    price_otm2           = otm2_call_short["price"]
-    symbol_otm2          = otm2_call_short["symbol"]
-    snapshot_id_otm2call = otm2_call_short["snapshot_id"]
-
-    otm2_call_long = otm2_call["long"]
-    z_price_otm2_5w          = otm2_call_long["z_price"]
-    z_volume_otm2_5w         = otm2_call_long["z_volume"]
-    z_iv_otm2_5w             = otm2_call_long["z_iv"]
-    snapshot_id_otm2call_5w  = otm2_call_long["snapshot_id"]
-
-    otm2_call_signal = (
-        z_price_otm2_5w  > 1.5 and
-        z_volume_otm2_5w > 1.5 and
-        z_iv_otm2_5w     > 1.5 and
-        z_price_otm2_2_3day  > 1.5 and
-        z_volume_otm2_2_3day > 1.5 and
-        z_iv_otm2_2_3day     > 1.5
-    )
-
-    # ===== OTM_2 PUT =====
-    otm2_put = get_option_metrics(groups, "OTM_2_PUT")
-    otm2_put_short = otm2_put["short"]
-
-    z_price_otm2_put_2_3day  = otm2_put_short["z_price"]
-    z_volume_otm2_put_2_3day = otm2_put_short["z_volume"]
-    z_iv_otm2_put_2_3day     = otm2_put_short["z_iv"]
-    strike_otm2_put          = otm2_put_short["strike"]
-    price_otm2_put           = otm2_put_short["price"]
-    symbol_otm2_put          = otm2_put_short["symbol"]
-    snapshot_id_otm2put      = otm2_put_short["snapshot_id"]
-
-    otm2_put_long = otm2_put["long"]
-    z_price_otm2_put_5w    = otm2_put_long["z_price"]
-    z_volume_otm2_put_5w   = otm2_put_long["z_volume"]
-    z_iv_otm2_put_5w       = otm2_put_long["z_iv"]
-    snapshot_id_otm2put_5w = otm2_put_long["snapshot_id"]
-
-    otm2_put_signal = (
-        z_price_otm2_put_5w  > 1.5 and
-        z_volume_otm2_put_5w > 1.5 and
-        z_iv_otm2_put_5w     > 1.5 and
-        z_price_otm2_put_2_3day  > 1.5 and
-        z_volume_otm2_put_2_3day > 1.5 and
-        z_iv_otm2_put_2_3day     > 1.5
-    )
-
-    # ===== OTM_2 DECISION =====
-    if otm2_call_signal and not otm2_put_signal:
-        send_text(
-            f"🚀 STRONG OTM_2 CALL SIGNAL\n\n"
-            f"Symbol: {symbol_otm2}\n"
-            f"Strike: {strike_otm2}\n"
-            f"Option Price (mid): {price_otm2}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows."
-        )
-        print("ALERT SENT (OTM_2 CALL)")
-
-        update_signal(
-            con,
-            symbol=symbol_otm2,
-            short_snapshot_id=snapshot_id_otm2call,
-            long_snapshot_id=snapshot_id_otm2call_5w,
-            call_put="C",
-            bucket="OTM_2",
-            signal_column="otm2_call_signal"
-        )
-
-    elif otm2_put_signal and not otm2_call_signal:
-        send_text(
-            f"⚠️ STRONG OTM_2 PUT SIGNAL\n\n"
-            f"Symbol: {symbol_otm2_put}\n"
-            f"Strike: {strike_otm2_put}\n"
-            f"Option Price (mid): {price_otm2_put}\n\n"
-            f"All price/volume/IV Z-scores > 1.5 in BOTH 2–3 day and 5-week windows."
-        )
-        print("ALERT SENT (OTM_2 PUT)")
-
-        update_signal(
-            con,
-            symbol=symbol_otm2_put,
-            short_snapshot_id=snapshot_id_otm2put,
-            long_snapshot_id=snapshot_id_otm2put_5w,
-            call_put="P",
-            bucket="OTM_2",
-            signal_column="otm2_put_signal"
-        )
-
-    elif otm2_call_signal and otm2_put_signal:
-        print("OTM_2 CALL & PUT both elevated → volatility spike, no directional OTM_2 signal.")
-    else:
-        print("No OTM_2 directional signal. Z-scores not all > 1.5.")
+    # Run buckets (ATM included now)
+    handle_bucket("ATM")
+    handle_bucket("OTM_1")
+    handle_bucket("OTM_2")
 
     con.close()
