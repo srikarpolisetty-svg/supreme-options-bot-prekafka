@@ -19,7 +19,7 @@ PORT = 4002
 DB_PATH = "options_data.db"
 
 # Global kill switch (entries + exits)
-EXECUTE_TRADES_DEFAULT = False
+EXECUTE_TRADES_DEFAULT = True
 
 # Optional: allow exits even when kill switch is off (recommended safety behavior)
 ALLOW_EXITS_WHEN_KILLED = True
