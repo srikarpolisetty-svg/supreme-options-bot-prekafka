@@ -1,17 +1,18 @@
 from execution_functions import get_all_symbols
 import duckdb
-from execution import run_execution_engine
+from IBKR_execution import main_execution
 
-con = duckdb.connect("options_data.db")
+DB_PATH = "options_data.db"
+CLIENT_ID = 9001   # pick a fixed, unused client id
 
+con = duckdb.connect(DB_PATH, read_only=True)
 
 symbols = get_all_symbols(con)
 
-
-for symbol in symbols:
-    run_execution_engine(symbol)
-
-
-
-
 con.close()
+
+# Run execution ONCE with all symbols
+main_execution(
+    client_id=CLIENT_ID,
+    symbols=symbols,
+)
