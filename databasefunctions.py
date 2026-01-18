@@ -60,42 +60,37 @@ def get_closest_strike(chain, call_put, target):
 import duckdb
 import pandas as pd
 
-DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
+DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/stocks_data.db"
 
-def compute_z_scores_for_bucket(
+def compute_z_scores_for_stock(
     symbol: str,
-    bucket: str,
-    call_put: str,
-    time_decay_bucket: str,
-    current_mid,
+    current_close,
     current_volume,
-    current_iv,
+    current_range_pct,
+    table: str = "stock_bars_raw_5m",
 ):
     """
-    Compute BOTH 3-day and 35-day (5w) z-scores for mid, volume, iv
-    from option_snapshots_raw.
+    Compute BOTH 3-day and 35-day z-scores for close, volume, range_pct
+    from a single raw stock table.
 
     Returns:
-        (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
+        (close_z_3d, vol_z_3d, range_z_3d, close_z_35d, vol_z_35d, range_z_35d)
         where any element can be None if we can't compute it safely.
     """
 
     with duckdb.connect(DB_PATH, read_only=True) as con:
         df = con.execute(
-            """
+            f"""
             SELECT
-                mid,
+                close,
                 volume,
-                iv,
+                range_pct,
                 timestamp
-            FROM option_snapshots_raw
+            FROM {table}
             WHERE symbol = ?
-              AND moneyness_bucket = ?
-              AND call_put = ?
-              AND time_decay_bucket = ?
               AND timestamp >= CURRENT_TIMESTAMP - INTERVAL 35 DAY
             """,
-            [symbol, bucket, call_put, time_decay_bucket],
+            [symbol],
         ).df()
 
     if df.empty:
@@ -119,7 +114,6 @@ def compute_z_scores_for_bucket(
         if std is None or pd.isna(std) or std <= 0:
             return None
 
-        # ensure curr is numeric
         try:
             curr_val = float(curr)
         except Exception:
@@ -128,7 +122,7 @@ def compute_z_scores_for_bucket(
         return (curr_val - mean) / std
 
     # --------------------
-    # 3-day window
+    # 3-day window (relative to most recent timestamp we have for this symbol)
     # --------------------
     tmax = df["timestamp"].max()
     if pd.isna(tmax):
@@ -136,18 +130,19 @@ def compute_z_scores_for_bucket(
     else:
         df_3d = df[df["timestamp"] >= (tmax - pd.Timedelta(days=3))]
 
-    mid_z_3d = z(current_mid,    df_3d["mid"])
-    vol_z_3d = z(current_volume, df_3d["volume"])
-    iv_z_3d  = z(current_iv,     df_3d["iv"])
+    close_z_3d = z(current_close,     df_3d["close"])
+    vol_z_3d   = z(current_volume,    df_3d["volume"])
+    range_z_3d = z(current_range_pct, df_3d["range_pct"])
 
     # --------------------
     # 35-day window
     # --------------------
-    mid_z_35d = z(current_mid,    df["mid"])
-    vol_z_35d = z(current_volume, df["volume"])
-    iv_z_35d  = z(current_iv,     df["iv"])
+    close_z_35d = z(current_close,     df["close"])
+    vol_z_35d   = z(current_volume,    df["volume"])
+    range_z_35d = z(current_range_pct, df["range_pct"])
 
-    return (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
+    return (close_z_3d, vol_z_3d, range_z_3d, close_z_35d, vol_z_35d, range_z_35d)
+
 
 
 
@@ -166,7 +161,7 @@ import pandas as pd
 
 
 SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-CACHE_PATH = "/home/ubuntu/supreme-options-bot/sp500_constituents.csv"
+CACHE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/sp500_constituents.csv"
 
 def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
