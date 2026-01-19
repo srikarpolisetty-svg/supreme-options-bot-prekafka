@@ -309,6 +309,68 @@ class IBKRExecutionEngine:
             except Exception:
                 continue
         return False
+    def cancel_all_option_orders(self):
+        """
+        Cancel all working orders for options (safety before liquidation).
+        """
+        working_status = {"Submitted", "PreSubmitted", "ApiPending"}
+        for t in self.ib.trades():
+            try:
+                if (
+                    t.contract is not None
+                    and t.contract.secType == "OPT"
+                    and t.orderStatus is not None
+                    and t.orderStatus.status in working_status
+                ):
+                    self.ib.cancelOrder(t.order)
+            except Exception:
+                continue
+
+        self.ib.sleep(0.2)
+
+    def close_all_option_positions_market(self, allow_exits: bool):
+        """
+        Force-liquidate all OPT positions with market sells.
+        """
+        if not allow_exits:
+            return
+
+        for p in self.get_positions():
+            try:
+                if p.contract is None or p.contract.secType != "OPT":
+                    continue
+
+                qty = float(p.position)
+                if qty <= 0:
+                    continue
+
+                self.place_market(p.contract, "SELL", int(qty), allow_orders=True)
+            except Exception:
+                continue
+
+    def enforce_daily_loss_forced_liquidation(self, max_day_risk: float, allow_exits: bool) -> bool:
+        """
+        If daily unrealized loss breaches max_day_risk:
+          - cancel working option orders
+          - market-close all option positions
+          - return False (disable new entries)
+        Otherwise return True.
+        """
+        daily_pnl = float(self.compute_unrealized_pnl_options())
+
+        if daily_pnl < 0 and abs(daily_pnl) >= float(max_day_risk):
+            print(
+                f"[EXEC][KILL] daily_unrealized_pnl={daily_pnl:.2f} breached max_day_risk={max_day_risk:.2f} -> LIQUIDATE",
+                flush=True
+            )
+
+            # stop stacking conflicting orders, then liquidate
+            self.cancel_all_option_orders()
+            self.close_all_option_positions_market(allow_exits=allow_exits)
+
+            return False
+
+        return True
 
     # -------------------------
     # Main loop
@@ -361,9 +423,12 @@ class IBKRExecutionEngine:
                 break
 
         # Daily loss gate: stops NEW entries, but still allows exits/management.
-        daily_pnl = self.compute_unrealized_pnl_options()
-        if daily_pnl < 0 and abs(daily_pnl) >= max_day_risk:
-            allow_entries = False
+        # Daily loss kill-switch: FORCE liquidation + disable NEW entries
+        allow_entries = bool(allow_entries) and self.enforce_daily_loss_forced_liquidation(
+            max_day_risk=max_day_risk,
+            allow_exits=allow_exits
+        )
+
 
         # -------------------------
         # Entries from DB signals (NO market data)
