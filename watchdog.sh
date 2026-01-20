@@ -9,7 +9,7 @@ flock -n 9 || exit 0
 # CONFIG
 # =========================
 PORT=4002
-TMUX_SESSION="ibgw"
+TMUX_SESSION="ib"
 DISPLAY_NUM=1
 LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
 
