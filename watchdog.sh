@@ -139,32 +139,31 @@ start_tmux_ibc() {
 restart_gateway() {
   log "Restarting IB Gateway via IBC"
 
+  # Kill ONLY IB-related Java processes
   pkill -f -i "ibgateway" || true
-  pkill -f -i "IBGateway" || true
-  pkill -f -i "tws" || true
+  pkill -f -i "IBC.jar" || true
+  pkill -f -i "ibcalpha.ibc" || true
   sleep 3
 
-  ensure_x_display
+  # Kill old tmux session if present
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux kill-session -t "$TMUX_SESSION"
+  fi
 
-  # IMPORTANT: close lock FD so tmux can't inherit it and hold the lock forever
-  exec 9>&-
+  log "Starting IB Gateway in tmux on DISPLAY=:1"
 
-  start_tmux_ibc
+  tmux new-session -d -s "$TMUX_SESSION" bash -lc "
+    export DISPLAY=:1
+    export XAUTHORITY=\$HOME/.Xauthority
+
+    echo '[watchdog] DISPLAY='\"\$DISPLAY\"
+    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway \
+      --ibc-ini \"${INI}\"
+  "
+
   sleep "$BOOT_SLEEP"
 }
 
-send_2fa_alert() {
-  "$PYTHON_BIN" - <<PY
-import sys
-sys.path.append("${ALERT_PYTHON_PATH}")
-from message import send_text
-send_text(
-    "⚠️ IB Gateway needs manual login / 2FA.\n\n"
-    "Watchdog restarted Gateway but API did not recover.\n"
-    "Please approve login in IB app or VNC."
-)
-PY
-}
 
 # =========================
 # MAIN
