@@ -13,7 +13,7 @@ flock -n 9 || exit 0
 # =========================
 PORT=4002
 TMUX_SESSION="ib"
-DISPLAY_NUM=1
+DISPLAY_NUM=2
 LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
 
 IBC_DIR="/home/ubuntu/IBC"
