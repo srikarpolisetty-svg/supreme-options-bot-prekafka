@@ -1,3 +1,103 @@
+import duckdb
+import pandas as pd
+
+DB_PATH = "/home/ubuntu/supreme-options-bot/options_data.db"
+
+def compute_z_scores_for_option_bucket(
+    symbol: str,
+    bucket: str,
+    call_put: str,
+    time_decay_bucket: str,
+    current_mid,
+    current_volume,
+    current_iv,
+    table: str = "option_snapshots_raw",
+):
+    """
+    Compute BOTH 3-day and 35-day z-scores for mid, volume, iv
+    from a single raw options table.
+
+    Returns:
+        (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
+        where any element can be None if we can't compute it safely.
+    """
+
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        df = con.execute(
+            f"""
+            SELECT
+                mid,
+                volume,
+                iv,
+                timestamp
+            FROM {table}
+            WHERE symbol = ?
+              AND moneyness_bucket = ?
+              AND call_put = ?
+              AND time_decay_bucket = ?
+              AND timestamp >= CURRENT_TIMESTAMP - INTERVAL 35 DAY
+            """,
+            [symbol, bucket, call_put, time_decay_bucket],
+        ).df()
+
+    if df.empty:
+        return (None, None, None, None, None, None)
+
+    # Make sure timestamp is datetime
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    # Helper: safe z
+    def z(curr, series: pd.Series):
+        if curr is None:
+            return None
+
+        s = series.dropna()
+        if s.empty:
+            return None
+
+        mean = s.mean()
+        std  = s.std()
+
+        if std is None or pd.isna(std) or std <= 0:
+            return None
+
+        try:
+            curr_val = float(curr)
+        except Exception:
+            return None
+
+        return (curr_val - mean) / std
+
+    # --------------------
+    # 3-day window (relative to most recent timestamp we have for this symbol+bucket)
+    # --------------------
+    tmax = df["timestamp"].max()
+    if pd.isna(tmax):
+        df_3d = df.iloc[0:0]
+    else:
+        df_3d = df[df["timestamp"] >= (tmax - pd.Timedelta(days=3))]
+
+    mid_z_3d = z(current_mid,    df_3d["mid"])
+    vol_z_3d = z(current_volume, df_3d["volume"])
+    iv_z_3d  = z(current_iv,     df_3d["iv"])
+
+    # --------------------
+    # 35-day window
+    # --------------------
+    mid_z_35d = z(current_mid,    df["mid"])
+    vol_z_35d = z(current_volume, df["volume"])
+    iv_z_35d  = z(current_iv,     df["iv"])
+
+    return (mid_z_3d, vol_z_3d, iv_z_3d, mid_z_35d, vol_z_35d, iv_z_35d)
+
+
+
+
+
+
+
+
+
 
 
 
@@ -57,91 +157,7 @@ def get_closest_strike(chain, call_put, target):
 
 
 
-import duckdb
-import pandas as pd
 
-DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/stocks_data.db"
-
-def compute_z_scores_for_stock(
-    symbol: str,
-    current_close,
-    current_volume,
-    current_range_pct,
-    table: str = "stock_bars_raw_5m",
-):
-    """
-    Compute BOTH 3-day and 35-day z-scores for close, volume, range_pct
-    from a single raw stock table.
-
-    Returns:
-        (close_z_3d, vol_z_3d, range_z_3d, close_z_35d, vol_z_35d, range_z_35d)
-        where any element can be None if we can't compute it safely.
-    """
-
-    with duckdb.connect(DB_PATH, read_only=True) as con:
-        df = con.execute(
-            f"""
-            SELECT
-                close,
-                volume,
-                range_pct,
-                timestamp
-            FROM {table}
-            WHERE symbol = ?
-              AND timestamp >= CURRENT_TIMESTAMP - INTERVAL 35 DAY
-            """,
-            [symbol],
-        ).df()
-
-    if df.empty:
-        return (None, None, None, None, None, None)
-
-    # Make sure timestamp is datetime
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
-    # Helper: safe z
-    def z(curr, series: pd.Series):
-        if curr is None:
-            return None
-
-        s = series.dropna()
-        if s.empty:
-            return None
-
-        mean = s.mean()
-        std  = s.std()
-
-        if std is None or pd.isna(std) or std <= 0:
-            return None
-
-        try:
-            curr_val = float(curr)
-        except Exception:
-            return None
-
-        return (curr_val - mean) / std
-
-    # --------------------
-    # 3-day window (relative to most recent timestamp we have for this symbol)
-    # --------------------
-    tmax = df["timestamp"].max()
-    if pd.isna(tmax):
-        df_3d = df.iloc[0:0]
-    else:
-        df_3d = df[df["timestamp"] >= (tmax - pd.Timedelta(days=3))]
-
-    close_z_3d = z(current_close,     df_3d["close"])
-    vol_z_3d   = z(current_volume,    df_3d["volume"])
-    range_z_3d = z(current_range_pct, df_3d["range_pct"])
-
-    # --------------------
-    # 35-day window
-    # --------------------
-    close_z_35d = z(current_close,     df["close"])
-    vol_z_35d   = z(current_volume,    df["volume"])
-    range_z_35d = z(current_range_pct, df["range_pct"])
-
-    return (close_z_3d, vol_z_3d, range_z_3d, close_z_35d, vol_z_35d, range_z_35d)
 
 
 
