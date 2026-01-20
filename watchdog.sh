@@ -12,8 +12,8 @@ flock -n 9 || exit 0
 # CONFIG
 # =========================
 PORT=4002
-TMUX_SESSION="ib"          # keep your chosen name
-DISPLAY_NUM=2              # TigerVNC owns :1
+TMUX_SESSION="ib"
+DISPLAY_NUM=2                 # TigerVNC owns :1
 LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
 
 IBC_DIR="/home/ubuntu/IBC"
@@ -29,6 +29,9 @@ SLEEP_BETWEEN=10
 
 ALERT_PYTHON_PATH="/home/ubuntu/supreme-options-bot-prekafka"
 
+# Keep tmux alive for debugging even if ibcstart exits instantly
+TMUX_KEEPALIVE_SECONDS=600
+
 # =========================
 # HELPERS
 # =========================
@@ -39,7 +42,6 @@ mkdir -p "$(dirname "$LOG")"
 
 debug_dump() {
   log "----- DEBUG DUMP BEGIN -----"
-
   log "User: $(whoami)"
   log "Host: $(hostname)"
   log "PWD: $(pwd)"
@@ -66,7 +68,6 @@ debug_dump() {
 
   log "tmux ls:"
   tmux ls 2>&1 | tee -a "$LOG" || log "  (no tmux server / no sessions)"
-
   log "----- DEBUG DUMP END -----"
 }
 
@@ -102,7 +103,7 @@ PY
 }
 
 # =========================
-# Ensure Xvfb (and LOG WHY it fails)
+# Ensure Xvfb (logs WHY it fails)
 # =========================
 ensure_xvfb() {
   if ! command -v Xvfb >/dev/null 2>&1; then
@@ -122,7 +123,6 @@ ensure_xvfb() {
   fi
 
   log "Starting Xvfb :${DISPLAY_NUM}"
-  # Capture stderr/stdout to a dedicated file for easy diagnosis
   local xvfb_log="$HOME/supreme-options-bot-prekafka/logs/xvfb_${DISPLAY_NUM}.log"
   nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1920x1080x24 >>"$xvfb_log" 2>&1 &
   sleep 1
@@ -138,30 +138,40 @@ ensure_xvfb() {
 }
 
 # =========================
-# Start tmux session + LOG exit code + pane output
+# Start tmux session + KEEP ALIVE + capture pane to file
 # =========================
 start_tmux_ibc() {
   log "Starting tmux session '$TMUX_SESSION' with IBC"
-  local start_log="$HOME/supreme-options-bot-prekafka/logs/tmux_start_${TMUX_SESSION}.log"
-  : >"$start_log" || true
 
-  # If session exists, kill it
+  local start_log="$HOME/supreme-options-bot-prekafka/logs/tmux_start_${TMUX_SESSION}.log"
+  local pane_log="$HOME/supreme-options-bot-prekafka/logs/tmux_pane_${TMUX_SESSION}.log"
+  : >"$start_log" || true
+  : >"$pane_log" || true
+
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     log "Killing existing tmux session: $TMUX_SESSION"
     tmux kill-session -t "$TMUX_SESSION" >>"$start_log" 2>&1 || true
   fi
 
-  # IMPORTANT: capture tmux stderr/stdout + exit code
+  # Start tmux. Keep it alive even if ibcstart exits instantly.
   set +e
   tmux new-session -d -s "$TMUX_SESSION" bash -lc "
-    set -e
+    set +e
     export DISPLAY=:${DISPLAY_NUM}
+
     echo '[watchdog] DISPLAY='\"\$DISPLAY\"
-    echo '[watchdog] running: ${IBC_START} --gateway --tws-path ${GATEWAY_DIR} --ibc-path ${IBC_DIR} --ini ${INI}'
+    echo '[watchdog] launching IBC...'
+    echo '[watchdog] cmd: ${IBC_START} --gateway --tws-path ${GATEWAY_DIR} --ibc-path ${IBC_DIR} --ini ${INI}'
+
     \"${IBC_START}\" --gateway \
       --tws-path \"${GATEWAY_DIR}\" \
       --ibc-path \"${IBC_DIR}\" \
       --ini \"${INI}\"
+
+    ec=\$?
+    echo \"[watchdog] ibcstart exited ec=\$ec\"
+    echo \"[watchdog] keeping tmux alive for ${TMUX_KEEPALIVE_SECONDS}s for debugging...\"
+    sleep ${TMUX_KEEPALIVE_SECONDS}
   " >>"$start_log" 2>&1
   local tmux_ec=$?
   set -e
@@ -170,23 +180,25 @@ start_tmux_ibc() {
   log "tmux start log (last 120 lines):"
   tail -n 120 "$start_log" | tee -a "$LOG" || true
 
-  # If tmux itself failed, stop here loudly
   if [[ $tmux_ec -ne 0 ]]; then
     log "ERROR: tmux failed to create the session"
     return 1
   fi
 
-  # Confirm session exists
   if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     log "ERROR: tmux reported success but session '$TMUX_SESSION' not found"
     tmux ls 2>&1 | tee -a "$LOG" || true
     return 1
   fi
 
-  # Capture pane output reliably (session:window.pane)
+  # Pipe pane output to a file so you never miss errors
+  tmux pipe-pane -t "${TMUX_SESSION}:0.0" -o "cat >> \"$pane_log\"" >>"$start_log" 2>&1 || true
+
   sleep 2
-  log "tmux pane output (startup):"
+  log "tmux pane output (startup) -> $pane_log:"
   tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+  log "tail pane log (last 120 lines):"
+  tail -n 120 "$pane_log" | tee -a "$LOG" || true
 
   return 0
 }
@@ -215,7 +227,6 @@ restart_gateway() {
   sleep 3
 
   ensure_xvfb
-
   start_tmux_ibc
 
   sleep "$BOOT_SLEEP"
@@ -269,6 +280,8 @@ for ((i=1; i<=RETRIES; i++)); do
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
       log "tmux pane output (checkpoint):"
       tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+      log "tail pane log:"
+      tail -n 120 "$HOME/supreme-options-bot-prekafka/logs/tmux_pane_${TMUX_SESSION}.log" | tee -a "$LOG" || true
     else
       log "tmux session '$TMUX_SESSION' not found at checkpoint"
       tmux ls 2>&1 | tee -a "$LOG" || true
