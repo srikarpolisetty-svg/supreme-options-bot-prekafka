@@ -2,42 +2,43 @@
 set -euo pipefail
 
 # =========================
-# LOCK (prevent overlaps, but DON'T let tmux inherit the lock FD)
-# =========================
-LOCKFILE="/tmp/ib_gateway_watchdog.lock"
-exec 9>"$LOCKFILE" || exit 1
-flock -n 9 || exit 0
-
-# =========================
 # CONFIG
 # =========================
+LOCKFILE="/tmp/ib_gateway_watchdog.lock"
+
 PORT=4002
 TMUX_SESSION="ib"
-DISPLAY_NUM=1   # TigerVNC display
-LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
+DISPLAY_NUM=1
 
-IBC_DIR="/home/ubuntu/IBC"
-GATEWAY_DIR="/home/ubuntu/Jts"
-INI="/home/ubuntu/IBC/config.ini"
+ROOT="$HOME/supreme-options-bot-prekafka"
+LOG="$ROOT/logs/watchdog.log"
+
 IBC_START="/home/ubuntu/IBC/target/IBCLinux/scripts/ibcstart.sh"
-
+INI="/home/ubuntu/IBC/config.ini"
 TWS_VERSION="1043"
+
 PYTHON_BIN="/home/ubuntu/optionsenv/bin/python"
+ALERT_PYTHON_PATH="$ROOT"
 
-BOOT_SLEEP=10
-RETRIES=18
-SLEEP_BETWEEN=10
-
-ALERT_PYTHON_PATH="/home/ubuntu/supreme-options-bot-prekafka"
+BOOT_SLEEP=12
+RETRIES=12
+SLEEP_BETWEEN=5
 TMUX_KEEPALIVE_SECONDS=600
 
+# --- NEW: VNC auto-start ---
+VNC_CMD="vncserver"
+VNC_START_WAIT=5
+
+# =========================
+# HELPERS
+# =========================
 ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 mkdir -p "$(dirname "$LOG")"
 
-# =========================
-# Health check
-# =========================
+# -------------------------
+# IB API health check
+# -------------------------
 api_ok() {
   "$PYTHON_BIN" - <<PY >/dev/null 2>&1
 from ib_insync import IB
@@ -51,56 +52,94 @@ try:
 except Exception:
     raise SystemExit(2)
 finally:
-    try:
-        ib.disconnect()
-    except Exception:
-        pass
+    try: ib.disconnect()
+    except Exception: pass
 PY
 }
 
-# =========================
-# TigerVNC-only display check (NO Xvfb)
-# =========================
-ensure_x_display() {
+# -------------------------
+# Send failure alert
+# -------------------------
+send_fail_alert() {
+  log "Sending failure alert"
+  "$PYTHON_BIN" - <<PY
+import sys
+sys.path.append("${ALERT_PYTHON_PATH}")
+from message import send_text
+send_text(
+    "⚠️ IB Gateway watchdog failed.\n\n"
+    "Tried starting IBC in tmux but API did not come up on port ${PORT}.\n"
+    "Please check VNC (:${DISPLAY_NUM}) and tmux session '${TMUX_SESSION}'."
+)
+PY
+}
+
+# -------------------------
+# Ensure TigerVNC display exists
+# If missing, attempt to start it.
+# -------------------------
+ensure_display() {
   if pgrep -af "Xtigervnc :${DISPLAY_NUM}\b|Xvnc :${DISPLAY_NUM}\b|vncserver :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
-    log "Using existing TigerVNC display :${DISPLAY_NUM}"
+    log "Display :${DISPLAY_NUM} present (TigerVNC)."
     return 0
   fi
 
-  log "ERROR: No VNC/X server found for display :${DISPLAY_NUM}"
-  log "Tip: start it with: vncserver :${DISPLAY_NUM}"
+  log "Display :${DISPLAY_NUM} not found — attempting to start TigerVNC"
+  set +e
+  ${VNC_CMD} :${DISPLAY_NUM} >>"$LOG" 2>&1
+  local ec=$?
+  set -e
+
+  if [[ $ec -ne 0 ]]; then
+    log "ERROR: Failed to start vncserver :${DISPLAY_NUM} (exit=$ec)"
+    return 1
+  fi
+
+  sleep "${VNC_START_WAIT}"
+
+  if pgrep -af "Xtigervnc :${DISPLAY_NUM}\b|Xvnc :${DISPLAY_NUM}\b|vncserver :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
+    log "TigerVNC started successfully on :${DISPLAY_NUM}"
+    return 0
+  fi
+
+  log "ERROR: vncserver started but display :${DISPLAY_NUM} not detected"
   return 1
 }
 
-# =========================
-# Start tmux + IBC (and keep tmux alive for debugging)
-# =========================
-start_tmux_ibc() {
-  log "Starting tmux session '$TMUX_SESSION' with IBC"
+# -------------------------
+# Is tmux session alive?
+# -------------------------
+tmux_ok() {
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
 
-  local start_log="$HOME/supreme-options-bot-prekafka/logs/tmux_start_${TMUX_SESSION}.log"
-  local pane_log="$HOME/supreme-options-bot-prekafka/logs/tmux_pane_${TMUX_SESSION}.log"
+# -------------------------
+# Start (or restart) IBC inside tmux
+# -------------------------
+start_ibc_in_tmux() {
+  log "Starting IBC in tmux session '$TMUX_SESSION' (DISPLAY=:${DISPLAY_NUM})"
+
+  local start_log="$ROOT/logs/tmux_start_${TMUX_SESSION}.log"
+  local pane_log="$ROOT/logs/tmux_pane_${TMUX_SESSION}.log"
   : >"$start_log" || true
   : >"$pane_log" || true
 
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  # Kill old session if it exists
+  if tmux_ok; then
+    log "Killing existing tmux session '$TMUX_SESSION'"
     tmux kill-session -t "$TMUX_SESSION" >>"$start_log" 2>&1 || true
   fi
 
+  # Start tmux running IBC. Keep session alive for debugging.
   set +e
   tmux new-session -d -s "$TMUX_SESSION" bash -lc "
     set +e
     export DISPLAY=:${DISPLAY_NUM}
+    export XAUTHORITY=\$HOME/.Xauthority
 
     echo '[watchdog] DISPLAY='\"\$DISPLAY\"
-    echo '[watchdog] launching IBC...'
-    echo '[watchdog] cmd: ${IBC_START} ${TWS_VERSION} --gateway --tws-path=${GATEWAY_DIR} --ibc-path=${IBC_DIR} --ibc-ini=${INI}'
-
-    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway \
-      --tws-path=\"${GATEWAY_DIR}\" \
-      --ibc-path=\"${IBC_DIR}\" \
-      --ibc-ini=\"${INI}\"
-
+    echo '[watchdog] cmd: ${IBC_START} ${TWS_VERSION} --gateway --ibc-ini ${INI}'
+    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway --ibc-ini \"${INI}\"
     ec=\$?
     echo \"[watchdog] ibcstart exited ec=\$ec\"
     echo \"[watchdog] keeping tmux alive for ${TMUX_KEEPALIVE_SECONDS}s...\"
@@ -110,84 +149,72 @@ start_tmux_ibc() {
   set -e
 
   log "tmux new-session exit_code=$tmux_ec"
-  tail -n 120 "$start_log" | tee -a "$LOG" || true
+  tail -n 80 "$start_log" | tee -a "$LOG" || true
 
   if [[ $tmux_ec -ne 0 ]]; then
-    log "ERROR: tmux failed to create the session"
+    log "ERROR: tmux failed to start session"
     return 1
   fi
 
-  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    log "ERROR: tmux reported success but session '$TMUX_SESSION' not found"
+  if ! tmux_ok; then
+    log "ERROR: tmux session not found after start"
     tmux ls 2>&1 | tee -a "$LOG" || true
     return 1
   fi
 
+  # Pipe pane output to a file + show a snippet
   tmux pipe-pane -t "${TMUX_SESSION}:0.0" -o "cat >> \"$pane_log\"" >>"$start_log" 2>&1 || true
   sleep 2
-  log "tmux pane output (startup):"
-  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
-  log "tail pane log:"
-  tail -n 120 "$pane_log" | tee -a "$LOG" || true
+  log "tmux pane output (startup tail):"
+  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 120 | tee -a "$LOG" || true
 
   return 0
 }
 
 # =========================
-# Restart Gateway
+# MAIN (lock scoped so tmux cannot inherit it)
 # =========================
-restart_gateway() {
-  log "Restarting IB Gateway via IBC"
+(
+  flock -n 9 || exit 0
 
-  # Kill ONLY IB-related Java processes
-  pkill -f -i "ibgateway" || true
-  pkill -f -i "IBC.jar" || true
-  pkill -f -i "ibcalpha.ibc" || true
-  sleep 3
+  log "Watchdog start"
 
-  # Kill old tmux session if present
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    tmux kill-session -t "$TMUX_SESSION"
-  fi
-
-  log "Starting IB Gateway in tmux on DISPLAY=:1"
-
-  tmux new-session -d -s "$TMUX_SESSION" bash -lc "
-    export DISPLAY=:1
-    export XAUTHORITY=\$HOME/.Xauthority
-
-    echo '[watchdog] DISPLAY='\"\$DISPLAY\"
-    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway \
-      --ibc-ini \"${INI}\"
-  "
-
-  sleep "$BOOT_SLEEP"
-}
-
-
-# =========================
-# MAIN
-# =========================
-if api_ok; then
-  log "OK — IB API healthy"
-  exit 0
-fi
-
-log "IB API unhealthy — restarting"
-if ! restart_gateway; then
-  log "ERROR: restart_gateway failed — aborting"
-  exit 1
-fi
-
-for ((i=1; i<=RETRIES; i++)); do
+  # 1) If API already healthy, done
   if api_ok; then
-    log "RECOVERED — IB API healthy after restart ($i/$RETRIES)"
+    log "OK — IB API healthy"
     exit 0
   fi
-  log "Waiting ($i/$RETRIES)"
-  sleep "$SLEEP_BETWEEN"
-done
 
-log "FAILED — likely 2FA required"
-send_2fa_alert
-exit 1
+  # 2) Ensure VNC display exists (auto-start if missing)
+  if ! ensure_display; then
+    send_fail_alert
+    exit 1
+  fi
+
+  # 3) Check tmux + start IBC
+  log "IB API unhealthy — starting IBC"
+  if ! start_ibc_in_tmux; then
+    send_fail_alert
+    exit 1
+  fi
+
+  sleep "$BOOT_SLEEP"
+
+  # 4) Retry health a few times
+  for ((i=1; i<=RETRIES; i++)); do
+    if api_ok; then
+      log "RECOVERED — IB API healthy ($i/$RETRIES)"
+      exit 0
+    fi
+    log "Waiting for API... ($i/$RETRIES)"
+    sleep "$SLEEP_BETWEEN"
+  done
+
+  # 5) Failed
+  log "FAILED — API still unhealthy after retries"
+  log "tmux pane output (failure tail):"
+  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+  send_fail_alert
+  exit 1
+
+) 9>"$LOCKFILE"
