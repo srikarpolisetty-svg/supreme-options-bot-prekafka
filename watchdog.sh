@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================
+# LOCK (prevent overlaps, but DON'T let tmux inherit the lock FD)
+# =========================
 LOCKFILE="/tmp/ib_gateway_watchdog.lock"
 exec 9>"$LOCKFILE" || exit 1
 flock -n 9 || exit 0
 
+# =========================
+# CONFIG
+# =========================
 PORT=4002
 TMUX_SESSION="ib"
-DISPLAY_NUM=1
+DISPLAY_NUM=1   # TigerVNC display
 LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
 
 IBC_DIR="/home/ubuntu/IBC"
@@ -15,9 +21,7 @@ GATEWAY_DIR="/home/ubuntu/Jts"
 INI="/home/ubuntu/IBC/config.ini"
 IBC_START="/home/ubuntu/IBC/target/IBCLinux/scripts/ibcstart.sh"
 
-# MUST be provided for your ibcstart.sh
 TWS_VERSION="1043"
-
 PYTHON_BIN="/home/ubuntu/optionsenv/bin/python"
 
 BOOT_SLEEP=10
@@ -31,6 +35,9 @@ ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 mkdir -p "$(dirname "$LOG")"
 
+# =========================
+# Health check
+# =========================
 api_ok() {
   "$PYTHON_BIN" - <<PY >/dev/null 2>&1
 from ib_insync import IB
@@ -51,35 +58,23 @@ finally:
 PY
 }
 
-ensure_xvfb() {
-  if ! command -v Xvfb >/dev/null 2>&1; then
-    log "ERROR: Xvfb not found in PATH"
-    return 1
-  fi
-
-  # Never collide with VNC/X servers
-  if pgrep -af "Xtigervnc :${DISPLAY_NUM}\b|Xvnc :${DISPLAY_NUM}\b|vncserver :${DISPLAY_NUM}\b|Xorg :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
-    log "ERROR: Display :${DISPLAY_NUM} is owned by VNC/X server. Pick another DISPLAY_NUM."
-    return 1
-  fi
-
-  if pgrep -af "Xvfb :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
-    log "Xvfb already running on :${DISPLAY_NUM}"
+# =========================
+# TigerVNC-only display check (NO Xvfb)
+# =========================
+ensure_x_display() {
+  if pgrep -af "Xtigervnc :${DISPLAY_NUM}\b|Xvnc :${DISPLAY_NUM}\b|vncserver :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
+    log "Using existing TigerVNC display :${DISPLAY_NUM}"
     return 0
   fi
 
-  log "Starting Xvfb :${DISPLAY_NUM}"
-  local xvfb_log="$HOME/supreme-options-bot-prekafka/logs/xvfb_${DISPLAY_NUM}.log"
-  nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1920x1080x24 >>"$xvfb_log" 2>&1 &
-  sleep 1
-
-  if ! pgrep -af "Xvfb :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
-    log "ERROR: Failed to start Xvfb :${DISPLAY_NUM}"
-    tail -n 120 "$xvfb_log" | tee -a "$LOG" || true
-    return 1
-  fi
+  log "ERROR: No VNC/X server found for display :${DISPLAY_NUM}"
+  log "Tip: start it with: vncserver :${DISPLAY_NUM}"
+  return 1
 }
 
+# =========================
+# Start tmux + IBC (and keep tmux alive for debugging)
+# =========================
 start_tmux_ibc() {
   log "Starting tmux session '$TMUX_SESSION' with IBC"
 
@@ -111,7 +106,7 @@ start_tmux_ibc() {
     echo \"[watchdog] keeping tmux alive for ${TMUX_KEEPALIVE_SECONDS}s...\"
     sleep ${TMUX_KEEPALIVE_SECONDS}
   " >>"$start_log" 2>&1
-  tmux_ec=$?
+  local tmux_ec=$?
   set -e
 
   log "tmux new-session exit_code=$tmux_ec"
@@ -138,6 +133,9 @@ start_tmux_ibc() {
   return 0
 }
 
+# =========================
+# Restart Gateway
+# =========================
 restart_gateway() {
   log "Restarting IB Gateway via IBC"
 
@@ -146,7 +144,11 @@ restart_gateway() {
   pkill -f -i "tws" || true
   sleep 3
 
-  ensure_xvfb
+  ensure_x_display
+
+  # IMPORTANT: close lock FD so tmux can't inherit it and hold the lock forever
+  exec 9>&-
+
   start_tmux_ibc
   sleep "$BOOT_SLEEP"
 }
@@ -164,6 +166,9 @@ send_text(
 PY
 }
 
+# =========================
+# MAIN
+# =========================
 if api_ok; then
   log "OK — IB API healthy"
   exit 0
