@@ -138,8 +138,7 @@ start_ibc_in_tmux() {
     export XAUTHORITY=\$HOME/.Xauthority
 
     echo '[watchdog] DISPLAY='\"\$DISPLAY\"
-    echo '[watchdog] cmd: ${IBC_START} ${TWS_VERSION} --gateway --ibc-ini ${INI}'
-    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway --ibc-ini \"${INI}\"
+    echo "[watchdog] cmd: ${IBC_START} ${TWS_VERSION} --gateway --ibc-ini=${INI}"
     ec=\$?
     echo \"[watchdog] ibcstart exited ec=\$ec\"
     echo \"[watchdog] keeping tmux alive for ${TMUX_KEEPALIVE_SECONDS}s...\"
