@@ -34,10 +34,17 @@ ALERT_PYTHON_PATH="/home/ubuntu/supreme-options-bot-prekafka"
 
 # --- Xvfb (headless display) ---
 XVFB_BIN="/usr/bin/Xvfb"
-XVFB_SCREEN="0"
 XVFB_RES="1920x1080x24"
 XVFB_PIDFILE="/tmp/xvfb_${DISPLAY_NUM}.pid"
 XVFB_START_WAIT=1
+
+# --- NEW: debugging / diagnostics ---
+TMUX_START_LOG="$HOME/ib_watchdog/tmux_start_${TMUX_SESSION}.log"
+TMUX_PANE_LOG="$HOME/ib_watchdog/tmux_pane_${TMUX_SESSION}.log"
+NETSTAT_BIN="/usr/bin/ss"             # fallback to netstat if ss missing
+DUMP_ON_EACH_RETRY=1                  # 1 = log brief status each retry
+DUMP_ON_FAILURE=1                     # 1 = dump lots of context on failure
+TAIL_LINES=200
 
 # =========================
 # HELPERS
@@ -139,14 +146,84 @@ ensure_display() {
   return 1
 }
 
+# -------------------------
+# Diagnostics: show why we're stalling
+# -------------------------
+port_listening() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E ":${PORT}\b" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp 2>/dev/null | grep -E ":${PORT}\b" >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
 
+dump_status_brief() {
+  log "---- status (brief) ----"
+  log "Xvfb(:${DISPLAY_NUM})="\
+"$(pgrep -af "Xvfb :${DISPLAY_NUM}\b" 2>/dev/null | head -n 1 || echo 'none')"
+  log "tmux_session="\
+"$(tmux has-session -t "$TMUX_SESSION" 2>/dev/null && echo 'present' || echo 'missing')"
+
+  if port_listening; then
+    log "port_${PORT}=LISTENING"
+  else
+    log "port_${PORT}=NOT_LISTENING"
+  fi
+
+  # show key processes if any
+  local j
+  j="$(pgrep -af "IBGateway|tws|java.*(ibgateway|IBGateway)" 2>/dev/null | head -n 3 || true)"
+  if [[ -n "${j:-}" ]]; then
+    log "java/IB (top):"
+    echo "$j" | tee -a "$LOG" >/dev/null
+  else
+    log "java/IB=none_detected"
+  fi
+}
+
+dump_status_full() {
+  log "==== status (FULL) ===="
+  dump_status_brief
+
+  log "---- processes: X / VNC / java / IBC ----"
+  ps aux | grep -E "Xvfb :${DISPLAY_NUM}\b|IBGateway|ibc|tws|java" | grep -v grep | tee -a "$LOG" || true
+
+  log "---- port listeners (ss/netstat) ----"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp | grep -E ":${PORT}\b" | tee -a "$LOG" || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp | grep -E ":${PORT}\b" | tee -a "$LOG" || true
+  else
+    log "No ss/netstat available."
+  fi
+
+  log "---- tmux start log tail: $TMUX_START_LOG ----"
+  tail -n "$TAIL_LINES" "$TMUX_START_LOG" 2>/dev/null | tee -a "$LOG" || true
+
+  log "---- tmux pane capture tail ----"
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n "$TAIL_LINES" | tee -a "$LOG" || true
+  else
+    log "tmux session missing; cannot capture pane."
+  fi
+
+  log "==== end FULL ===="
+}
 
 start_ibc_in_tmux() {
   log "Starting IBC in new tmux session '$TMUX_SESSION' (DISPLAY=:${DISPLAY_NUM})"
 
+  mkdir -p "$(dirname "$TMUX_START_LOG")"
+  : >"$TMUX_START_LOG" || true
+  : >"$TMUX_PANE_LOG" || true
+
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     log "Killing old tmux session '$TMUX_SESSION'"
-    tmux kill-session -t "$TMUX_SESSION" || true
+    tmux kill-session -t "$TMUX_SESSION" >>"$TMUX_START_LOG" 2>&1 || true
   fi
 
   tmux new-session -d -s "$TMUX_SESSION" bash -lc "
@@ -163,7 +240,17 @@ start_ibc_in_tmux() {
     echo \"[tmux] ibcstart exited ec=\$ec\"
     echo \"[tmux] keeping tmux alive for ${TMUX_KEEPALIVE_SECONDS}s\"
     sleep ${TMUX_KEEPALIVE_SECONDS}
-  "
+  " >>"$TMUX_START_LOG" 2>&1
+
+  # pipe pane output to file so we can read it without attaching
+  tmux pipe-pane -t "${TMUX_SESSION}:0.0" -o "cat >> \"$TMUX_PANE_LOG\"" >>"$TMUX_START_LOG" 2>&1 || true
+  sleep 2
+
+  log "tmux start log tail:"
+  tail -n 80 "$TMUX_START_LOG" | tee -a "$LOG" || true
+
+  log "tmux pane capture tail:"
+  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 120 | tee -a "$LOG" || true
 }
 
 # =========================
@@ -193,18 +280,31 @@ start_ibc_in_tmux() {
 
   sleep "$BOOT_SLEEP"
 
-  # 4) retry health
+  # 4) retry health (with diagnostics)
   for ((i=1; i<=RETRIES; i++)); do
     if api_ok; then
       log "RECOVERED — IB API healthy ($i/$RETRIES)"
       exit 0
     fi
+
     log "Waiting for API... ($i/$RETRIES)"
+
+    if [[ "$DUMP_ON_EACH_RETRY" -eq 1 ]]; then
+      dump_status_brief
+      # quick hint: if port isn't even listening, we know it's not an API issue yet
+      if ! port_listening; then
+        log "HINT: Port ${PORT} is not listening yet → IB Gateway likely not fully started/logged in."
+      fi
+    fi
+
     sleep "$SLEEP_BETWEEN"
   done
 
-  # 5) failed → alert
+  # 5) failed → dump context + alert
   log "FAILED — API still unhealthy after retries"
+  if [[ "$DUMP_ON_FAILURE" -eq 1 ]]; then
+    dump_status_full
+  fi
   send_fail_alert
   exit 1
 
