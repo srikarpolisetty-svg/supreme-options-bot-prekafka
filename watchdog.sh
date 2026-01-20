@@ -12,8 +12,8 @@ flock -n 9 || exit 0
 # CONFIG
 # =========================
 PORT=4002
-TMUX_SESSION="ib"
-DISPLAY_NUM=2
+TMUX_SESSION="ib"          # keep your chosen name
+DISPLAY_NUM=2              # TigerVNC owns :1
 LOG="$HOME/supreme-options-bot-prekafka/logs/watchdog.log"
 
 IBC_DIR="/home/ubuntu/IBC"
@@ -37,7 +37,6 @@ log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
 mkdir -p "$(dirname "$LOG")"
 
-# Print a mini-debug snapshot (super useful when stuff fails)
 debug_dump() {
   log "----- DEBUG DUMP BEGIN -----"
 
@@ -45,6 +44,7 @@ debug_dump() {
   log "Host: $(hostname)"
   log "PWD: $(pwd)"
   log "DISPLAY will be :${DISPLAY_NUM}"
+  log "TMUX_SESSION=$TMUX_SESSION"
   log "Paths:"
   log "  IBC_START=$IBC_START"
   log "  IBC_DIR=$IBC_DIR"
@@ -52,34 +52,24 @@ debug_dump() {
   log "  INI=$INI"
   log "  PYTHON_BIN=$PYTHON_BIN"
 
-  # Existence + perms
   ls -l "$IBC_START" "$INI" "$PYTHON_BIN" 2>&1 | tee -a "$LOG" || true
   ls -ld "$GATEWAY_DIR" "$IBC_DIR" 2>&1 | tee -a "$LOG" || true
 
-  # Xvfb
-  if pgrep -af "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
-    log "Xvfb running:"
-    pgrep -af "Xvfb :${DISPLAY_NUM}" 2>&1 | tee -a "$LOG" || true
-  else
-    log "Xvfb NOT running"
-  fi
+  log "Xvfb status for :${DISPLAY_NUM}:"
+  pgrep -af "Xvfb :${DISPLAY_NUM}\b" 2>&1 | tee -a "$LOG" || log "  (not running)"
 
-  # Port
   log "Port listeners for ${PORT}:"
   ss -ltnp 2>&1 | grep ":${PORT}\b" | tee -a "$LOG" || log "  (none listening)"
 
-  # Processes
   log "Relevant processes:"
-  ps aux 2>&1 | egrep -i "ibgateway|IBC|tws|java|Xvfb|tmux" | grep -v egrep | tee -a "$LOG" || true
+  ps aux 2>&1 | egrep -i "ibgateway|IBC|tws|java|Xvfb|tmux|Xtigervnc|Xvnc|vncserver" | grep -v egrep | tee -a "$LOG" || true
 
-  # tmux list
   log "tmux ls:"
   tmux ls 2>&1 | tee -a "$LOG" || log "  (no tmux server / no sessions)"
 
   log "----- DEBUG DUMP END -----"
 }
 
-# Trap errors so you *always* see why it died
 on_err() {
   local ec=$?
   log "ERROR: watchdog crashed (exit_code=$ec) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
@@ -87,9 +77,6 @@ on_err() {
   exit "$ec"
 }
 trap on_err ERR
-
-# Also log every command if you want ultra-verbose debugging:
-# set -x
 
 # =========================
 # Check if IB API is healthy
@@ -115,7 +102,7 @@ PY
 }
 
 # =========================
-# Ensure Xvfb
+# Ensure Xvfb (and LOG WHY it fails)
 # =========================
 ensure_xvfb() {
   if ! command -v Xvfb >/dev/null 2>&1; then
@@ -123,16 +110,85 @@ ensure_xvfb() {
     return 1
   fi
 
-  if ! pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
-    log "Starting Xvfb :${DISPLAY_NUM}"
-    nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1920x1080x24 >>"$LOG" 2>&1 &
-    sleep 1
-  fi
-
-  if ! pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
-    log "ERROR: Failed to start Xvfb :${DISPLAY_NUM}"
+  # Never collide with VNC/X servers
+  if pgrep -af "Xtigervnc :${DISPLAY_NUM}\b|Xvnc :${DISPLAY_NUM}\b|vncserver :${DISPLAY_NUM}\b|Xorg :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
+    log "ERROR: Display :${DISPLAY_NUM} is already owned by VNC/X server. Pick another DISPLAY_NUM."
     return 1
   fi
+
+  if pgrep -af "Xvfb :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
+    log "Xvfb already running on :${DISPLAY_NUM}"
+    return 0
+  fi
+
+  log "Starting Xvfb :${DISPLAY_NUM}"
+  # Capture stderr/stdout to a dedicated file for easy diagnosis
+  local xvfb_log="$HOME/supreme-options-bot-prekafka/logs/xvfb_${DISPLAY_NUM}.log"
+  nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1920x1080x24 >>"$xvfb_log" 2>&1 &
+  sleep 1
+
+  if ! pgrep -af "Xvfb :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
+    log "ERROR: Failed to start Xvfb :${DISPLAY_NUM}"
+    log "Last 120 lines of $xvfb_log:"
+    tail -n 120 "$xvfb_log" | tee -a "$LOG" || true
+    return 1
+  fi
+
+  log "Xvfb started OK on :${DISPLAY_NUM}"
+}
+
+# =========================
+# Start tmux session + LOG exit code + pane output
+# =========================
+start_tmux_ibc() {
+  log "Starting tmux session '$TMUX_SESSION' with IBC"
+  local start_log="$HOME/supreme-options-bot-prekafka/logs/tmux_start_${TMUX_SESSION}.log"
+  : >"$start_log" || true
+
+  # If session exists, kill it
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    log "Killing existing tmux session: $TMUX_SESSION"
+    tmux kill-session -t "$TMUX_SESSION" >>"$start_log" 2>&1 || true
+  fi
+
+  # IMPORTANT: capture tmux stderr/stdout + exit code
+  set +e
+  tmux new-session -d -s "$TMUX_SESSION" bash -lc "
+    set -e
+    export DISPLAY=:${DISPLAY_NUM}
+    echo '[watchdog] DISPLAY='\"\$DISPLAY\"
+    echo '[watchdog] running: ${IBC_START} --gateway --tws-path ${GATEWAY_DIR} --ibc-path ${IBC_DIR} --ini ${INI}'
+    \"${IBC_START}\" --gateway \
+      --tws-path \"${GATEWAY_DIR}\" \
+      --ibc-path \"${IBC_DIR}\" \
+      --ini \"${INI}\"
+  " >>"$start_log" 2>&1
+  local tmux_ec=$?
+  set -e
+
+  log "tmux new-session exit_code=$tmux_ec"
+  log "tmux start log (last 120 lines):"
+  tail -n 120 "$start_log" | tee -a "$LOG" || true
+
+  # If tmux itself failed, stop here loudly
+  if [[ $tmux_ec -ne 0 ]]; then
+    log "ERROR: tmux failed to create the session"
+    return 1
+  fi
+
+  # Confirm session exists
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    log "ERROR: tmux reported success but session '$TMUX_SESSION' not found"
+    tmux ls 2>&1 | tee -a "$LOG" || true
+    return 1
+  fi
+
+  # Capture pane output reliably (session:window.pane)
+  sleep 2
+  log "tmux pane output (startup):"
+  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+
+  return 0
 }
 
 # =========================
@@ -142,20 +198,17 @@ restart_gateway() {
   log "Restarting IB Gateway via IBC"
   debug_dump
 
-  # Validate required paths early (fail with clear log)
   for p in "$IBC_START" "$INI" "$PYTHON_BIN" "$IBC_DIR" "$GATEWAY_DIR"; do
     if [[ ! -e "$p" ]]; then
       log "ERROR: Missing path: $p"
       return 1
     fi
   done
-
   if [[ ! -x "$IBC_START" ]]; then
     log "ERROR: ibcstart.sh is not executable: $IBC_START"
     return 1
   fi
 
-  # Kill anything old
   pkill -f -i "ibgateway" || true
   pkill -f -i "IBGateway" || true
   pkill -f -i "tws" || true
@@ -163,35 +216,7 @@ restart_gateway() {
 
   ensure_xvfb
 
-  # Kill previous tmux session if it exists
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    log "Killing existing tmux session: $TMUX_SESSION"
-    tmux kill-session -t "$TMUX_SESSION"
-  fi
-
-  # Start tmux and immediately capture any startup errors
-  log "Starting tmux session '$TMUX_SESSION' with IBC"
-  tmux new-session -d -s "$TMUX_SESSION" bash -lc "
-    export DISPLAY=:${DISPLAY_NUM}
-    echo '[watchdog] DISPLAY='\"\$DISPLAY\"
-    echo '[watchdog] running:' \"$IBC_START\" --gateway --tws-path \"$GATEWAY_DIR\" --ibc-path \"$IBC_DIR\" --ini \"$INI\"
-    \"$IBC_START\" --gateway \
-      --tws-path \"$GATEWAY_DIR\" \
-      --ibc-path \"$IBC_DIR\" \
-      --ini \"$INI\"
-  " 2>>"$LOG"
-
-  # Confirm tmux session exists
-  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    log "ERROR: tmux session '$TMUX_SESSION' was not created"
-    tmux ls 2>&1 | tee -a "$LOG" || true
-    return 1
-  fi
-
-  # Give it a moment and then dump pane output into the log
-  sleep 2
-  log "tmux pane output (startup):"
-  tmux capture-pane -t "$TMUX_SESSION" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+  start_tmux_ibc
 
   sleep "$BOOT_SLEEP"
 }
@@ -224,7 +249,10 @@ if api_ok; then
 fi
 
 log "IB API unhealthy — restarting"
-restart_gateway
+if ! restart_gateway; then
+  log "ERROR: restart_gateway failed — aborting early (check logs above)"
+  exit 1
+fi
 
 for ((i=1; i<=RETRIES; i++)); do
   if api_ok; then
@@ -234,12 +262,17 @@ for ((i=1; i<=RETRIES; i++)); do
 
   log "Waiting ($i/$RETRIES)"
 
-  # Every few retries, dump useful diagnostics
   if (( i == 1 || i == 3 || i == 6 || i == 12 || i == RETRIES )); then
     log "Health still failing — checkpoint debug"
     debug_dump
-    log "tmux pane output (checkpoint):"
-    tmux capture-pane -t "$TMUX_SESSION" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      log "tmux pane output (checkpoint):"
+      tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>&1 | tail -n 200 | tee -a "$LOG" || true
+    else
+      log "tmux session '$TMUX_SESSION' not found at checkpoint"
+      tmux ls 2>&1 | tee -a "$LOG" || true
+    fi
   fi
 
   sleep "$SLEEP_BETWEEN"
