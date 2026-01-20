@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 LOCKFILE="/tmp/ib_gateway_watchdog.lock"
 exec 9>"$LOCKFILE" || exit 1
 flock -n 9 || exit 0
@@ -29,7 +30,7 @@ ALERT_PYTHON_PATH="/home/ubuntu/supreme-options-bot-prekafka"
 # =========================
 # HELPERS
 # =========================
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
+ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
 mkdir -p "$(dirname "$LOG")"
@@ -85,8 +86,13 @@ restart_gateway() {
     tmux kill-session -t "$TMUX_SESSION"
   fi
 
-  tmux new-session -d -s "$TMUX_SESSION" \
-    "export DISPLAY=:${DISPLAY_NUM}; bash -lc '$IBC_START --gateway --tws-path=\"$GATEWAY_DIR\" --ibc-path=\"$IBC_DIR\" --ini=\"$INI\"'"
+  tmux new-session -d -s "$TMUX_SESSION" bash -lc "
+    export DISPLAY=:${DISPLAY_NUM}
+    \"$IBC_START\" --gateway \
+      --tws-path \"$GATEWAY_DIR\" \
+      --ibc-path \"$IBC_DIR\" \
+      --ini \"$INI\"
+  "
 
   sleep "$BOOT_SLEEP"
 }
