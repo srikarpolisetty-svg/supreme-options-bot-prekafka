@@ -24,6 +24,9 @@ INI="/home/ubuntu/IBC/config.ini"
 TWS_VERSION="1043"
 TMUX_KEEPALIVE_SECONDS=600
 
+# --- NEW: IBC root path (prevents default /opt/ibc) ---
+IBC_PATH="/home/ubuntu/IBC/target/IBCLinux"
+
 # --- retries ---
 BOOT_SLEEP=10
 RETRIES=12
@@ -174,7 +177,6 @@ dump_status_brief() {
     log "port_${PORT}=NOT_LISTENING"
   fi
 
-  # show key processes if any
   local j
   j="$(pgrep -af "IBGateway|tws|java.*(ibgateway|IBGateway)" 2>/dev/null | head -n 3 || true)"
   if [[ -n "${j:-}" ]]; then
@@ -232,9 +234,9 @@ start_ibc_in_tmux() {
 
     echo '[tmux] DISPLAY='\"\$DISPLAY\"
     echo '[tmux] Starting IB Gateway via IBC'
-    echo \"[tmux] cmd: ${IBC_START} ${TWS_VERSION} --gateway --ibc-ini=${INI}\"
+    echo \"[tmux] cmd: ${IBC_START} ${TWS_VERSION} --gateway --ibc-path=${IBC_PATH} --ibc-ini=${INI}\"
 
-    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway --ibc-ini=\"${INI}\"
+    \"${IBC_START}\" \"${TWS_VERSION}\" --gateway --ibc-path=\"${IBC_PATH}\" --ibc-ini=\"${INI}\"
     ec=\$?
 
     echo \"[tmux] ibcstart exited ec=\$ec\"
@@ -242,7 +244,6 @@ start_ibc_in_tmux() {
     sleep ${TMUX_KEEPALIVE_SECONDS}
   " >>"$TMUX_START_LOG" 2>&1
 
-  # pipe pane output to file so we can read it without attaching
   tmux pipe-pane -t "${TMUX_SESSION}:0.0" -o "cat >> \"$TMUX_PANE_LOG\"" >>"$TMUX_START_LOG" 2>&1 || true
   sleep 2
 
@@ -261,26 +262,22 @@ start_ibc_in_tmux() {
 
   log "Watchdog start"
 
-  # 1) healthy? done
   if api_ok; then
     log "OK — IB API healthy"
     exit 0
   fi
 
-  # 2) ensure headless display exists
   if ! ensure_display; then
     log "FAILED — could not ensure Xvfb display"
     send_fail_alert
     exit 1
   fi
 
-  # 3) unhealthy → start IBC
   log "IB API unhealthy — launching IBC"
   start_ibc_in_tmux
 
   sleep "$BOOT_SLEEP"
 
-  # 4) retry health (with diagnostics)
   for ((i=1; i<=RETRIES; i++)); do
     if api_ok; then
       log "RECOVERED — IB API healthy ($i/$RETRIES)"
@@ -291,7 +288,6 @@ start_ibc_in_tmux() {
 
     if [[ "$DUMP_ON_EACH_RETRY" -eq 1 ]]; then
       dump_status_brief
-      # quick hint: if port isn't even listening, we know it's not an API issue yet
       if ! port_listening; then
         log "HINT: Port ${PORT} is not listening yet → IB Gateway likely not fully started/logged in."
       fi
@@ -300,7 +296,6 @@ start_ibc_in_tmux() {
     sleep "$SLEEP_BETWEEN"
   done
 
-  # 5) failed → dump context + alert
   log "FAILED — API still unhealthy after retries"
   if [[ "$DUMP_ON_FAILURE" -eq 1 ]]; then
     dump_status_full
