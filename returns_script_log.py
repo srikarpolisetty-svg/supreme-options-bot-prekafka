@@ -6,14 +6,41 @@ import sys
 from zoneinfo import ZoneInfo
 import exchange_calendars as ecals
 
+
+def _third_friday_of_month(d: datetime.date) -> datetime.date:
+    first = d.replace(day=1)
+    days_until_friday = (4 - first.weekday()) % 7  # Friday=4
+    first_friday = first + datetime.timedelta(days=days_until_friday)
+    return first_friday + datetime.timedelta(days=14)
+
+
+def _is_third_friday_week(d: datetime.date) -> tuple[bool, datetime.date]:
+    tf = _third_friday_of_month(d)
+    week_start = tf - datetime.timedelta(days=tf.weekday())   # Monday
+    week_end = week_start + datetime.timedelta(days=6)        # Sunday
+    return (week_start <= d <= week_end), tf
+
+
 NY_TZ = ZoneInfo("America/New_York")
 XNYS = ecals.get_calendar("XNYS")  # NYSE
 
-now1 = datetime.datetime.now(NY_TZ)
+now_ny = datetime.datetime.now(NY_TZ)
+
+# -------------------------
+# Skip the entire 3rd-Friday week (monthly expiration week)
+# -------------------------
+is_tf_week, tf_date = _is_third_friday_week(now_ny.date())
+if is_tf_week:
+    print(
+        f"[SKIP] Third-Friday week detected. third_friday={tf_date} "
+        f"today={now_ny.date()} (NY). Exiting.",
+        flush=True
+    )
+    sys.exit(0)
 
 # True only if the exchange is actually open right now (includes holidays/early closes)
-if not XNYS.is_open_on_minute(now1, ignore_breaks=True):
-    print(f"Market closed (holiday/after-hours) — skipping insert. now={now1}")
+if not XNYS.is_open_on_minute(now_ny, ignore_breaks=True):
+    print(f"Market closed (holiday/after-hours) — skipping insert. now={now_ny}")
     sys.exit(0)
 
 
@@ -77,6 +104,11 @@ fill_return_label_executionsignals(
 )
 
 fill_return_label_executionsignals(
+    "opt_ret_next_open",
+    "DATE(f.timestamp) > DATE(base.timestamp)"
+)
+
+fill_return_label_executionsignals(
     "opt_ret_1d",
     "f.timestamp >= base.timestamp + INTERVAL 1 DAY"
 )
@@ -88,22 +120,7 @@ fill_return_label_executionsignals(
     order_dir="DESC"
 )
 
-
 now = datetime.datetime.now()
 print(now.strftime("%Y-%m-%d %H:%M"))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

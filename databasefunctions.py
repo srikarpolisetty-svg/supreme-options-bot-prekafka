@@ -229,10 +229,12 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
     Master ingest for a single options run_id.
     Tables already exist.
     Single-DB version (no *_5w tables).
-    Safely skips ingestion when a shard glob matches zero files.
-    Uses union_by_name=True to avoid Parquet schema mismatch (NULL vs DOUBLE).
-    """
 
+    Hardens SELECT * by:
+      - skipping when a glob matches zero files
+      - asserting parquet column order == table column order (so SELECT * is safe)
+      - still using union_by_name=True for NULL/DOUBLE compatibility
+    """
     import glob
     import duckdb
 
@@ -240,12 +242,45 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
     enriched_dir = f"runs/{run_id}/option_snapshots_enriched"
     signals_dir = f"runs/{run_id}/option_snapshots_execution_signals"
 
+    raw_glob = f"{raw_dir}/shard_*.parquet"
+    enriched_glob = f"{enriched_dir}/shard_*.parquet"
+    signals_glob = f"{signals_dir}/shard_*.parquet"
+
+    # ---- guard: if nothing exists anywhere, exit cleanly ----
+    if not (glob.glob(raw_glob) or glob.glob(enriched_glob) or glob.glob(signals_glob)):
+        print(f"[master_ingest] no parquet files found for run_id={run_id}", flush=True)
+        return
+
     con = duckdb.connect(db_path)
 
-    def ingest_if_exists(table: str, pattern: str):
-        files = glob.glob(pattern)
-        if not files:
-            print(f"[master_ingest] skip {table}: no files for {pattern}")
+    def _assert_schema_order(table: str, parquet_glob: str) -> bool:
+        """
+        Enforce: parquet columns (names + order) exactly match table columns.
+        Keeps SELECT * safe. Returns False if no files.
+        """
+        if not glob.glob(parquet_glob):
+            print(f"[master_ingest] skip {table}: no files", flush=True)
+            return False
+
+        pq_cols = con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=True)",
+            [parquet_glob],
+        ).df()["column_name"].tolist()
+
+        tbl_cols = con.execute(
+            f"PRAGMA table_info('{table}')"
+        ).df()["name"].tolist()
+
+        if pq_cols != tbl_cols:
+            raise RuntimeError(
+                f"[master_ingest] schema/order mismatch for {table}\n"
+                f"  parquet={pq_cols}\n"
+                f"  table ={tbl_cols}"
+            )
+        return True
+
+    def ingest_if_exists(table: str, parquet_glob: str):
+        if not _assert_schema_order(table, parquet_glob):
             return
 
         con.execute(
@@ -253,31 +288,18 @@ def master_ingest(run_id: str, db_path: str = "options_data.db"):
             INSERT INTO {table}
             SELECT * FROM read_parquet(?, union_by_name=True)
             """,
-            [pattern],
+            [parquet_glob],
         )
 
     try:
         con.execute("BEGIN;")
 
-        # Execution signals (optional per run)
-        ingest_if_exists(
-            "option_snapshots_execution_signals",
-            f"{signals_dir}/shard_*.parquet",
-        )
-
-        # Enriched snapshots
-        ingest_if_exists(
-            "option_snapshots_enriched",
-            f"{enriched_dir}/shard_*.parquet",
-        )
-
-        # Raw snapshots
-        ingest_if_exists(
-            "option_snapshots_raw",
-            f"{raw_dir}/shard_*.parquet",
-        )
+        ingest_if_exists("option_snapshots_execution_signals", signals_glob)
+        ingest_if_exists("option_snapshots_enriched", enriched_glob)
+        ingest_if_exists("option_snapshots_raw", raw_glob)
 
         con.execute("COMMIT;")
+        print(f"[master_ingest] committed run_id={run_id}", flush=True)
 
     except Exception:
         con.execute("ROLLBACK;")

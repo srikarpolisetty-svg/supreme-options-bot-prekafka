@@ -171,7 +171,14 @@ class App(EWrapper, EClient):
 
         done_event = self._pending_snapshot.get(reqId)
         if done_event:
-            if ("bid" in q and "ask" in q) or ("last" in q):
+            bid = q.get("bid")
+            ask = q.get("ask")
+            last = q.get("last")
+
+            has_good_last = (last is not None and last > 0)
+            has_good_book = (bid is not None and ask is not None and bid > 0 and ask > 0)
+
+            if has_good_last or has_good_book:
                 done_event.set()
     def get_option_quotes_ibkr_batch(self, opt_contracts, timeout: float = 1.2):
         # 1) send all snapshot requests immediately
@@ -268,10 +275,14 @@ class App(EWrapper, EClient):
             is_friday = (d.weekday() == 4)
             is_within_4_days = 0 <= (d - now).days <= 4
 
-            if is_friday and is_within_4_days:
+            # 3rd Friday = day between 15 and 21 inclusive
+            is_third_friday = 15 <= d.day <= 21
+
+            if is_friday and is_within_4_days and not is_third_friday:
                 return exp
 
         return None
+
 
     def get_closest_strike_ibkr(self, target: float) -> float:
         if not self.strikes:

@@ -9,6 +9,27 @@ from zoneinfo import ZoneInfo
 import duckdb
 import exchange_calendars as ecals
 from ib_insync import IB, Contract, MarketOrder, StopOrder, Order
+from datetime import date, timedelta
+
+def third_friday_of_month(d: date) -> date:
+    """
+    Return the 3rd Friday of the month for date d.
+    """
+    first = d.replace(day=1)
+    days_to_friday = (4 - first.weekday()) % 7  # Friday = 4
+    first_friday = first + timedelta(days=days_to_friday)
+    return first_friday + timedelta(days=14)
+
+
+def is_third_friday_week(d: date) -> tuple[bool, date]:
+    """
+    Returns (True, third_friday_date) if d is in the Monday–Sunday
+    week that contains the 3rd Friday of the month.
+    """
+    tf = third_friday_of_month(d)
+    week_start = tf - timedelta(days=tf.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)       # Sunday
+    return week_start <= d <= week_end, tf
 
 
 # =========================
@@ -371,12 +392,88 @@ class IBKRExecutionEngine:
             return False
 
         return True
+# =========================
+# FIX 1) Robust _row_conid (works reliably with df.itertuples())
+# Put this INSIDE the IBKRExecutionEngine class (replace your current _row_conid)
+# =========================
+
+    def _row_conid(self, row) -> int | None:
+        """
+        Robust conId extraction from a pandas itertuples() row.
+        Handles attribute name mangling + None/NaN.
+        """
+        d = row._asdict() if hasattr(row, "_asdict") else {}
+
+        for name in (
+            "conId", "conid", "con_id",
+            "option_conId", "option_conid",
+            "contract_id", "contractId",
+        ):
+            v = d.get(name, getattr(row, name, None))
+            if v is None:
+                continue
+            try:
+                # handle NaN (float)
+                import math
+                if isinstance(v, float) and math.isnan(v):
+                    continue
+            except Exception:
+                pass
+
+            try:
+                return int(v)
+            except Exception:
+                # strings like "123.0"
+                try:
+                    return int(float(str(v).strip()))
+                except Exception:
+                    continue
+
+        return None
+# =========================
+# FIX 2) Exclude protective sells (TRAIL/STP/etc) from open-order gates
+# Add this helper INSIDE the class, then update run()
+# =========================
+
+    def _is_entry_order_trade(self, t) -> bool:
+        """
+        True only for ENTRY orders (BUY). Excludes protective sells like TRAIL/STP.
+        """
+        try:
+            o = getattr(t, "order", None)
+            if o is None:
+                return False
+
+            if getattr(o, "action", None) != "BUY":
+                return False
+
+            # exclude trailing (and any other protective types you might use)
+            if getattr(o, "orderType", None) in {"TRAIL", "STP", "STOP"}:
+                return False
+
+            return True
+        except Exception:
+            return False
 
     # -------------------------
     # Main loop
     # -------------------------
     def run(self, symbol: str):
         # market-hours gate
+        today = datetime.now(self.NY_TZ).date()
+        is_tf_week, tf_date = is_third_friday_week(today)
+
+        if is_tf_week:
+            print(
+                f"[EXEC][SKIP] Third-Friday week detected. "
+                f"third_friday={tf_date} today={today}",
+                flush=True
+            )
+            return
+
+        # -------------------------
+        # Market hours gate
+        # -------------------------
         now = datetime.now(self.NY_TZ)
         if not self.XNYS.is_open_on_minute(now, ignore_breaks=True):
             return
@@ -408,19 +505,30 @@ class IBKRExecutionEngine:
         # -------------------------
         # Entry gates
         # -------------------------
+        # -------------------------
+        # Entry gates (ENTRY orders only)
+        # -------------------------
         open_trades = [
             t for t in self.ib.trades()
-            if t.orderStatus.status in {"Submitted", "PreSubmitted", "ApiPending"}
+            if getattr(getattr(t, "orderStatus", None), "status", None) in {"Submitted", "PreSubmitted", "ApiPending"}
         ]
-        if len(open_trades) >= self.risk.max_open_orders:
+
+        open_entry_trades = [t for t in open_trades if self._is_entry_order_trade(t)]
+
+        if len(open_entry_trades) >= self.risk.max_open_orders:
             allow_entries = False
 
         now_utc = datetime.now(timezone.utc)
-        for t in open_trades:
-            ts = self.order_submit_time.get(t.order.orderId)
+        for t in open_entry_trades:
+            try:
+                oid = t.order.orderId
+            except Exception:
+                continue
+            ts = self.order_submit_time.get(oid)
             if ts and (now_utc - ts).total_seconds() <= self.risk.min_order_age_seconds:
                 allow_entries = False
                 break
+
 
         # Daily loss gate: stops NEW entries, but still allows exits/management.
         # Daily loss kill-switch: FORCE liquidation + disable NEW entries
