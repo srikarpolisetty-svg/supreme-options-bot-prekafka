@@ -96,32 +96,33 @@ PY
 # Ensure DISPLAY exists using Xvfb (start if missing)
 # -------------------------
 ensure_display() {
-  # If something is already listening on :DISPLAY_NUM, accept it.
+  local xvfb_log="$HOME/ib_watchdog/xvfb_${DISPLAY_NUM}.log"
+  mkdir -p "$(dirname "$xvfb_log")"
+
   if pgrep -af "Xvfb :${DISPLAY_NUM}\b" >/dev/null 2>&1; then
     log "Display :${DISPLAY_NUM} already present (Xvfb)."
     return 0
   fi
 
-  # If pidfile exists but process is dead, clean it.
-  if [[ -f "$XVFB_PIDFILE" ]]; then
-    local oldpid
-    oldpid="$(cat "$XVFB_PIDFILE" 2>/dev/null || true)"
-    if [[ -n "${oldpid:-}" ]] && kill -0 "$oldpid" 2>/dev/null; then
-      log "Display :${DISPLAY_NUM} present via PID $oldpid (pidfile)."
-      return 0
-    fi
-    rm -f "$XVFB_PIDFILE" || true
+  # stale lock/socket cleanup if no process is running
+  if [[ -e "/tmp/.X${DISPLAY_NUM}-lock" || -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ]]; then
+    log "Found X lock/socket for :${DISPLAY_NUM} but no Xvfb process. Cleaning stale files."
+    rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" >>"$LOG" 2>&1 || true
   fi
 
   if [[ ! -x "$XVFB_BIN" ]]; then
-    log "ERROR: Xvfb not found at $XVFB_BIN. Install Xvfb (package is usually 'xvfb')."
+    log "ERROR: Xvfb not found at $XVFB_BIN (try: sudo apt-get install -y xvfb)"
     return 1
   fi
 
   log "Display :${DISPLAY_NUM} missing — starting Xvfb (:${DISPLAY_NUM})"
+  : >"$xvfb_log" || true
+
   set +e
-  "$XVFB_BIN" ":${DISPLAY_NUM}" -screen "$XVFB_SCREEN" "$XVFB_RES" -ac +extension RANDR \
-    >>"$LOG" 2>&1 &
+  "$XVFB_BIN" ":${DISPLAY_NUM}" \
+    -screen 0 "$XVFB_RES" \
+    -ac +extension RANDR -nolisten tcp \
+    >>"$xvfb_log" 2>&1 &
   local xvfb_pid=$!
   set -e
 
@@ -133,9 +134,12 @@ ensure_display() {
     return 0
   fi
 
-  log "ERROR: Xvfb failed to start on :${DISPLAY_NUM}"
+  log "ERROR: Xvfb failed to start on :${DISPLAY_NUM}. Last 80 lines of $xvfb_log:"
+  tail -n 80 "$xvfb_log" | tee -a "$LOG" || true
   return 1
 }
+
+
 
 start_ibc_in_tmux() {
   log "Starting IBC in new tmux session '$TMUX_SESSION' (DISPLAY=:${DISPLAY_NUM})"
