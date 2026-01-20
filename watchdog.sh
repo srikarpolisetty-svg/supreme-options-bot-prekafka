@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+LOCKFILE="/tmp/ib_gateway_watchdog.lock"
+exec 9>"$LOCKFILE" || exit 1
+flock -n 9 || exit 0
 
 # =========================
 # CONFIG
