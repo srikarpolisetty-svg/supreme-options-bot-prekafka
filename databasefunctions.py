@@ -3,7 +3,7 @@ import pandas as pd
 
 DB_PATH = "/home/ubuntu/supreme-options-bot/options_data.db"
 
-def compute_z_scores_for_option_bucket(
+def compute_z_scores_for_bucket(
     symbol: str,
     bucket: str,
     call_put: str,
