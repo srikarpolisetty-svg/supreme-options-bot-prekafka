@@ -238,7 +238,7 @@ class IBKRExecutionEngine:
         df = con.execute(
             """
             SELECT *
-            FROM options_snapshots_enriched
+            FROM option_snapshots_enriched
             WHERE symbol = ?
             ORDER BY timestamp DESC
             LIMIT ?
