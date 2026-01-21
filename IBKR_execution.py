@@ -249,16 +249,6 @@ class IBKRExecutionEngine:
         return df
 
 
-    def _row_conid(self, row) -> int | None:
-        for name in ("conId", "conid", "con_id", "option_conId", "option_conid", "contract_id", "contractId"):
-            v = getattr(row, name, None)
-            if v is not None:
-                try:
-                    return int(v)
-                except Exception:
-                    pass
-        return None
-
     def _row_est_cost(self, row, qty: int) -> float | None:
         """
         Estimate total dollars for `qty` contracts from DB columns.
@@ -330,11 +320,18 @@ class IBKRExecutionEngine:
             except Exception:
                 continue
         return False
+# === ALSO ADD PRINTS FOR "when you cancel orders" and "when you liquidate" ===
+# These are in enforce_daily_loss_forced_liquidation / cancel_all_option_orders / close_all_option_positions_market.
+# Add the prints below inside those existing methods (minimal edits).
+
     def cancel_all_option_orders(self):
         """
         Cancel all working orders for options (safety before liquidation).
         """
+        self.log("CANCEL_ALL_OPT_ORDERS_START")
+
         working_status = {"Submitted", "PreSubmitted", "ApiPending"}
+        cancelled = 0
         for t in self.ib.trades():
             try:
                 if (
@@ -343,19 +340,29 @@ class IBKRExecutionEngine:
                     and t.orderStatus is not None
                     and t.orderStatus.status in working_status
                 ):
+                    oid = getattr(getattr(t, "order", None), "orderId", None)
+                    conid = getattr(getattr(t, "contract", None), "conId", None)
+                    self.log("CANCEL_OPT_ORDER", orderId=oid, conid=conid, status=t.orderStatus.status)
                     self.ib.cancelOrder(t.order)
-            except Exception:
+                    cancelled += 1
+            except Exception as e:
+                self.log("CANCEL_OPT_ORDER_ERR", err=str(e))
                 continue
 
         self.ib.sleep(0.2)
+        self.log("CANCEL_ALL_OPT_ORDERS_END", cancelled=cancelled)
 
     def close_all_option_positions_market(self, allow_exits: bool):
         """
         Force-liquidate all OPT positions with market sells.
         """
         if not allow_exits:
+            self.log("LIQUIDATE_SKIP_EXITS_DISABLED")
             return
 
+        self.log("LIQUIDATE_START")
+
+        sold = 0
         for p in self.get_positions():
             try:
                 if p.contract is None or p.contract.secType != "OPT":
@@ -365,33 +372,32 @@ class IBKRExecutionEngine:
                 if qty <= 0:
                     continue
 
+                conid = getattr(p.contract, "conId", None)
+                self.log("LIQUIDATE_SELL_MKT_PLACING", conid=conid, qty=int(qty))
                 self.place_market(p.contract, "SELL", int(qty), allow_orders=True)
-            except Exception:
+                sold += 1
+            except Exception as e:
+                self.log("LIQUIDATE_ERR", err=str(e))
                 continue
 
+        self.log("LIQUIDATE_END", positions_sold=sold)
+
     def enforce_daily_loss_forced_liquidation(self, max_day_risk: float, allow_exits: bool) -> bool:
-        """
-        If daily unrealized loss breaches max_day_risk:
-          - cancel working option orders
-          - market-close all option positions
-          - return False (disable new entries)
-        Otherwise return True.
-        """
         daily_pnl = float(self.compute_unrealized_pnl_options())
+        self.log("DAILY_PNL", daily_unreal_pnl=round(float(daily_pnl), 2), max_day_risk=round(float(max_day_risk), 2))
 
         if daily_pnl < 0 and abs(daily_pnl) >= float(max_day_risk):
-            print(
-                f"[EXEC][KILL] daily_unrealized_pnl={daily_pnl:.2f} breached max_day_risk={max_day_risk:.2f} -> LIQUIDATE",
-                flush=True
-            )
+            self.log("DAILY_LOSS_BREACH", daily_unreal_pnl=round(float(daily_pnl), 2), max_day_risk=round(float(max_day_risk), 2), action="LIQUIDATE")
 
             # stop stacking conflicting orders, then liquidate
             self.cancel_all_option_orders()
             self.close_all_option_positions_market(allow_exits=allow_exits)
 
+            self.log("DAILY_LOSS_KILL_DONE")
             return False
 
         return True
+
 # =========================
 # FIX 1) Robust _row_conid (works reliably with df.itertuples())
 # Put this INSIDE the IBKRExecutionEngine class (replace your current _row_conid)
@@ -458,27 +464,130 @@ class IBKRExecutionEngine:
     # -------------------------
     # Main loop
     # -------------------------
+# === DROP-IN PRINT VISIBILITY (no structure change) ===
+# Add the helper methods anywhere INSIDE IBKRExecutionEngine (e.g., right after __init__)
+
+    def log(self, event: str, **fields):
+        # super simple prints; no structure changes elsewhere
+        try:
+            ts = datetime.now(self.NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        extras = ""
+        if fields:
+            parts = []
+            for k, v in fields.items():
+                try:
+                    parts.append(f"{k}={v}")
+                except Exception:
+                    parts.append(f"{k}=?")
+            extras = " " + " ".join(parts)
+
+        print(f"[EXEC][{event}] {ts}{extras}", flush=True)
+
+    def _print_positions_snapshot(self, where: str):
+        try:
+            pos = self.get_positions()
+        except Exception as e:
+            self.log("POS_SNAPSHOT_ERR", where=where, err=str(e))
+            return
+
+        opt_pos = []
+        for p in pos:
+            try:
+                if p.contract and p.contract.secType == "OPT" and float(p.position) != 0:
+                    opt_pos.append(p)
+            except Exception:
+                continue
+
+        self.log("POS_SNAPSHOT", where=where, opt_positions=len(opt_pos))
+
+        if not opt_pos:
+            return
+
+        for p in opt_pos:
+            try:
+                conid = int(p.contract.conId)
+                qty = float(p.position)
+                avgCost = getattr(p, "avgCost", None)
+                sym = getattr(p.contract, "symbol", None)
+                self.log("POS",
+                         where=where,
+                         symbol=sym,
+                         conid=conid,
+                         qty=qty,
+                         avgCost=avgCost)
+            except Exception as e:
+                self.log("POS_ERR", where=where, err=str(e))
+
+    def _print_open_orders_snapshot(self, where: str):
+        working_status = {"Submitted", "PreSubmitted", "ApiPending"}
+        try:
+            trades = list(self.ib.trades())
+        except Exception as e:
+            self.log("ORD_SNAPSHOT_ERR", where=where, err=str(e))
+            return
+
+        working = []
+        for t in trades:
+            try:
+                st = getattr(getattr(t, "orderStatus", None), "status", None)
+                if st in working_status:
+                    working.append(t)
+            except Exception:
+                continue
+
+        self.log("ORD_SNAPSHOT", where=where, working=len(working))
+
+        for t in working:
+            try:
+                o = getattr(t, "order", None)
+                c = getattr(t, "contract", None)
+                self.log("ORD",
+                         where=where,
+                         orderId=getattr(o, "orderId", None),
+                         status=getattr(getattr(t, "orderStatus", None), "status", None),
+                         action=getattr(o, "action", None),
+                         orderType=getattr(o, "orderType", None),
+                         qty=getattr(o, "totalQuantity", None),
+                         conid=getattr(c, "conId", None),
+                         symbol=getattr(c, "symbol", None))
+            except Exception as e:
+                self.log("ORD_ERR", where=where, err=str(e))
+
+
+# === NOW ADD PRINTS INSIDE run() AT THE REQUESTED POINTS ===
+# (Paste these changes into your existing run() body exactly where shown.)
+
     def run(self, symbol: str):
+        # Engine start / symbol start
+        self.log("RUN_START", symbol=symbol, client_id=self.client_id, port=self.port)
+
         # market-hours gate
         today = datetime.now(self.NY_TZ).date()
         is_tf_week, tf_date = is_third_friday_week(today)
 
+        # market open? third-Friday week?
+        self.log("GATE_CAL", symbol=symbol, today=today, is_third_friday_week=is_tf_week, third_friday=tf_date)
+
         if is_tf_week:
-            print(
-                f"[EXEC][SKIP] Third-Friday week detected. "
-                f"third_friday={tf_date} today={today}",
-                flush=True
-            )
+            self.log("SKIP_THIRD_FRIDAY_WEEK", symbol=symbol, today=today, third_friday=tf_date)
             return
 
         # -------------------------
         # Market hours gate
         # -------------------------
         now = datetime.now(self.NY_TZ)
-        if not self.XNYS.is_open_on_minute(now, ignore_breaks=True):
+        is_open = bool(self.XNYS.is_open_on_minute(now, ignore_breaks=True))
+        self.log("GATE_MARKET_HOURS", symbol=symbol, now=str(now), is_open=is_open)
+
+        if not is_open:
+            self.log("SKIP_MARKET_CLOSED", symbol=symbol, now=str(now))
             return
 
         self.connect()
+        self.log("CONNECTED", symbol=symbol, isConnected=self.ib.isConnected())
 
         # Global kill switch
         allow_orders = bool(self.execute_trades_default)
@@ -486,6 +595,13 @@ class IBKRExecutionEngine:
         # Exits can optionally remain enabled even when kill switch is off
         allow_exits = bool(allow_orders or self.allow_exits_when_killed)
         allow_entries = bool(allow_orders)  # entries only when explicitly enabled
+
+        # allow_orders / allow_entries / allow_exits
+        self.log("GATE_ALLOW_FLAGS", symbol=symbol, allow_orders=allow_orders, allow_entries=allow_entries, allow_exits=allow_exits)
+
+        # Positions snapshot at start of run()
+        self._print_positions_snapshot(where="run_start")
+        self._print_open_orders_snapshot(where="run_start")
 
         # Buying power / budgets
         acct = {}
@@ -502,9 +618,17 @@ class IBKRExecutionEngine:
         max_trade_risk = float(buying_power) * self.risk.per_trade_risk_pct
         max_day_risk = float(buying_power) * self.risk.per_day_risk_pct
 
-        # -------------------------
-        # Entry gates
-        # -------------------------
+        # buying power, max_trade_risk, max_day_risk
+        self.log(
+            "BUDGETS",
+            symbol=symbol,
+            buying_power=buying_power,
+            per_trade_risk_pct=self.risk.per_trade_risk_pct,
+            per_day_risk_pct=self.risk.per_day_risk_pct,
+            max_trade_risk=max_trade_risk,
+            max_day_risk=max_day_risk,
+        )
+
         # -------------------------
         # Entry gates (ENTRY orders only)
         # -------------------------
@@ -512,36 +636,53 @@ class IBKRExecutionEngine:
             t for t in self.ib.trades()
             if getattr(getattr(t, "orderStatus", None), "status", None) in {"Submitted", "PreSubmitted", "ApiPending"}
         ]
-
         open_entry_trades = [t for t in open_trades if self._is_entry_order_trade(t)]
+
+        # open entry trades count
+        self.log("GATE_OPEN_ENTRY_TRADES", symbol=symbol, open_entry_trades=len(open_entry_trades), max_open_orders=self.risk.max_open_orders)
 
         if len(open_entry_trades) >= self.risk.max_open_orders:
             allow_entries = False
+            self.log("GATE_MAX_OPEN_ORDERS_HIT", symbol=symbol, open_entry_trades=len(open_entry_trades), max_open_orders=self.risk.max_open_orders)
 
         now_utc = datetime.now(timezone.utc)
+        min_age_triggered = False
+        min_age_seconds = int(self.risk.min_order_age_seconds)
+
         for t in open_entry_trades:
             try:
                 oid = t.order.orderId
             except Exception:
                 continue
             ts = self.order_submit_time.get(oid)
-            if ts and (now_utc - ts).total_seconds() <= self.risk.min_order_age_seconds:
-                allow_entries = False
-                break
+            if ts:
+                age_s = (now_utc - ts).total_seconds()
+                if age_s <= min_age_seconds:
+                    allow_entries = False
+                    min_age_triggered = True
+                    self.log("GATE_MIN_ORDER_AGE_HIT", symbol=symbol, orderId=oid, age_s=int(age_s), min_age_s=min_age_seconds)
+                    break
 
+        # min-age triggered? (summary)
+        self.log("GATE_MIN_ORDER_AGE", symbol=symbol, triggered=min_age_triggered, min_age_s=min_age_seconds)
 
-        # Daily loss gate: stops NEW entries, but still allows exits/management.
-        # Daily loss kill-switch: FORCE liquidation + disable NEW entries
+        # Daily loss gate: FORCE liquidation + disable NEW entries
+        # (your enforce function already prints the kill line; add extra context prints)
+        self.log("DAILY_LOSS_CHECK", symbol=symbol, max_day_risk=max_day_risk, allow_exits=allow_exits)
+
+        allow_entries_before = bool(allow_entries)
         allow_entries = bool(allow_entries) and self.enforce_daily_loss_forced_liquidation(
             max_day_risk=max_day_risk,
             allow_exits=allow_exits
         )
-
+        self.log("DAILY_LOSS_RESULT", symbol=symbol, allow_entries_before=allow_entries_before, allow_entries_after=allow_entries)
 
         # -------------------------
         # Entries from DB signals (NO market data)
         # -------------------------
         df = self.load_recent_signal_rows(symbol)
+        self.log("DB_ROWS_LOADED", symbol=symbol, rows=int(len(df)))
+
         signal_cols = [
             "atm_call_signal", "atm_put_signal",
             "otm1_call_signal", "otm1_put_signal",
@@ -551,20 +692,35 @@ class IBKRExecutionEngine:
         seen_conids: set[int] = set()
 
         for row in df.itertuples():
-            if not any(bool(getattr(row, c, False)) for c in signal_cols):
+            # row timestamp, which signal cols were true
+            row_ts = getattr(row, "timestamp", None)
+            fired = []
+            for c in signal_cols:
+                try:
+                    if bool(getattr(row, c, False)):
+                        fired.append(c)
+                except Exception:
+                    pass
+
+            if not fired:
                 continue
+
+            self.log("SIGNAL_ROW", symbol=symbol, row_ts=row_ts, fired=",".join(fired))
 
             conid = self._row_conid(row)
             if conid is None:
+                self.log("SIGNAL_SKIP_NO_CONID", symbol=symbol, row_ts=row_ts)
                 continue
 
-            # Dedupe per run (avoid multiple buys from multiple recent rows)
+            # Dedupe per run
             if conid in seen_conids:
+                self.log("SIGNAL_SKIP_DUP_CONID", symbol=symbol, conid=conid, row_ts=row_ts)
                 continue
             seen_conids.add(conid)
 
-            # Don't re-enter if already long this exact contract
+            # Don't re-enter if already long
             if self._already_long_conid(conid):
+                self.log("ENTRY_SKIP_ALREADY_LONG", symbol=symbol, conid=conid)
                 continue
 
             contract = self.opt_contract_from_conid(conid)
@@ -572,19 +728,59 @@ class IBKRExecutionEngine:
             qty = int(self.risk.entry_qty)
             est_cost = self._row_est_cost(row, qty=qty)
             if est_cost is None:
+                self.log("ENTRY_SKIP_NO_EST_COST", symbol=symbol, conid=conid, qty=qty, row_ts=row_ts)
                 continue
 
-            if allow_entries and est_cost <= max_trade_risk:
+            passed_risk = bool(est_cost <= max_trade_risk)
+
+            # extracted conid, qty, est_cost, “passed risk?”
+            self.log(
+                "ENTRY_EVAL",
+                symbol=symbol,
+                conid=conid,
+                qty=qty,
+                est_cost=round(float(est_cost), 2),
+                max_trade_risk=round(float(max_trade_risk), 2),
+                passed_risk=passed_risk,
+                allow_entries=allow_entries,
+            )
+
+            if allow_entries and passed_risk:
+                # when you place BUY
+                self.log("ORDER_BUY_PLACING", symbol=symbol, conid=conid, qty=qty)
                 tr = self.place_market(contract, "BUY", qty, allow_orders=allow_entries)
                 if tr is not None:
-                    # Attach trailing stop if not already working
+                    try:
+                        oid = tr.order.orderId
+                    except Exception:
+                        oid = None
+                    self.log("ORDER_BUY_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid)
+
+                    # Positions snapshot after order placement
+                    self._print_positions_snapshot(where="after_buy")
+                    self._print_open_orders_snapshot(where="after_buy")
+
+                    # when a TRAIL is placed
                     if not self._has_working_trailing_sell(conid):
-                        self.place_trailing_stop_pct_sell(
+                        self.log("ORDER_TRAIL_PLACING", symbol=symbol, conid=conid, qty=qty, trail_pct=float(self.risk.trail_pct * 100.0))
+                        tr2 = self.place_trailing_stop_pct_sell(
                             contract=contract,
                             qty=qty,
                             trailing_pct=self.risk.trail_pct * 100.0,  # 0.20 -> 20.0
                             allow_orders=allow_exits,
                         )
+                        if tr2 is not None:
+                            try:
+                                oid2 = tr2.order.orderId
+                            except Exception:
+                                oid2 = None
+                            self.log("ORDER_TRAIL_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid2)
+
+                            # Positions snapshot after order placement
+                            self._print_positions_snapshot(where="after_trail")
+                            self._print_open_orders_snapshot(where="after_trail")
+                    else:
+                        self.log("ORDER_TRAIL_SKIP_EXISTS", symbol=symbol, conid=conid)
 
         # -------------------------
         # Position management (only touches OPEN positions)
@@ -598,38 +794,80 @@ class IBKRExecutionEngine:
 
             mark = self.get_mark_price_snapshot(p.contract)
             if mark is None:
+                self.log("PM_SKIP_NO_MARK", symbol=symbol, conid=conid, qty=qty)
                 continue
 
             ret = self.position_return_pct(p, mark)
             if ret is None:
+                self.log("PM_SKIP_NO_RET", symbol=symbol, conid=conid, qty=qty, mark=mark)
                 continue
 
-            # +25%: set breakeven stop (only if no working stop sell exists)
+            self.log("PM_STATE", symbol=symbol, conid=conid, qty=qty, mark=round(float(mark), 4), ret_pct=round(float(ret), 2))
+
+            # +25%: set breakeven stop
             if ret >= 25 and not self._has_working_stop_sell(conid):
                 entry = self._entry_from_position(p)
                 if entry and entry > 0:
-                    self.place_stop_close_sell(p.contract, qty, float(entry), allow_orders=allow_exits)
+                    # when a stop is placed
+                    self.log("ORDER_BE_STOP_PLACING", symbol=symbol, conid=conid, qty=qty, stop_price=round(float(entry), 4), ret_pct=round(float(ret), 2))
+                    tr3 = self.place_stop_close_sell(p.contract, qty, float(entry), allow_orders=allow_exits)
+                    if tr3 is not None:
+                        try:
+                            oid3 = tr3.order.orderId
+                        except Exception:
+                            oid3 = None
+                        self.log("ORDER_BE_STOP_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid3)
 
-            # +50%: take 1 off (only if qty>=2, and only once by checking working/filled state is hard;
-            # simplest is: don't do it if you already have a SELL market working for this conId)
+                        self._print_positions_snapshot(where="after_be_stop")
+                        self._print_open_orders_snapshot(where="after_be_stop")
+            elif ret >= 25:
+                self.log("ORDER_BE_STOP_SKIP_EXISTS", symbol=symbol, conid=conid, ret_pct=round(float(ret), 2))
+
+            # +50%: take 1 off
             if ret >= 50 and qty >= 2:
-                # Avoid stacking multiple take-profit sells
                 has_working_sell_mkt = any(
                     (t.order.action == "SELL" and t.order.orderType == "MKT")
                     for t in self._open_orders_for_conid(conid)
                     if getattr(t, "order", None) is not None
                 )
                 if not has_working_sell_mkt:
-                    self.place_market(p.contract, "SELL", 1, allow_orders=allow_exits)
+                    # when you sell 1 at +50
+                    self.log("ORDER_TP1_PLACING", symbol=symbol, conid=conid, sell_qty=1, ret_pct=round(float(ret), 2))
+                    tr4 = self.place_market(p.contract, "SELL", 1, allow_orders=allow_exits)
+                    if tr4 is not None:
+                        try:
+                            oid4 = tr4.order.orderId
+                        except Exception:
+                            oid4 = None
+                        self.log("ORDER_TP1_PLACED", symbol=symbol, conid=conid, sell_qty=1, orderId=oid4)
 
-            # Ensure a trailing stop exists (safety net)
+                        self._print_positions_snapshot(where="after_tp1")
+                        self._print_open_orders_snapshot(where="after_tp1")
+                else:
+                    self.log("ORDER_TP1_SKIP_WORKING_SELL_MKT", symbol=symbol, conid=conid, ret_pct=round(float(ret), 2))
+
+            # Ensure a trailing stop exists
             if not self._has_working_trailing_sell(conid):
-                self.place_trailing_stop_pct_sell(
+                self.log("ORDER_TRAIL_ENSURE_PLACING", symbol=symbol, conid=conid, qty=qty, trail_pct=float(self.risk.trail_pct * 100.0))
+                tr5 = self.place_trailing_stop_pct_sell(
                     contract=p.contract,
                     qty=qty,
                     trailing_pct=self.risk.trail_pct * 100.0,
                     allow_orders=allow_exits,
                 )
+                if tr5 is not None:
+                    try:
+                        oid5 = tr5.order.orderId
+                    except Exception:
+                        oid5 = None
+                    self.log("ORDER_TRAIL_ENSURE_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid5)
+
+                    self._print_positions_snapshot(where="after_trail_ensure")
+                    self._print_open_orders_snapshot(where="after_trail_ensure")
+            else:
+                self.log("ORDER_TRAIL_ENSURE_SKIP_EXISTS", symbol=symbol, conid=conid)
+
+        self.log("RUN_END", symbol=symbol)
 
 
 def open_connection(client_id: int) -> IBKRExecutionEngine:
