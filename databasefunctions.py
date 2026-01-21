@@ -22,7 +22,7 @@ def compute_z_scores_for_bucket(
         where any element can be None if we can't compute it safely.
     """
 
-    with duckdb.connect(DB_PATH, read_only=True) as con:
+    with duckdb.connect(DB_PATH) as con:
         df = con.execute(
             f"""
             SELECT
