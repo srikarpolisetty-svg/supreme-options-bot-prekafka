@@ -2,7 +2,7 @@ from execution_functions import get_all_symbols
 import duckdb
 from IBKR_execution import main_execution
 
-DB_PATH = "options_data.db"
+DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
 CLIENT_ID = 9001   # pick a fixed, unused client id
 
 con = duckdb.connect(DB_PATH, read_only=True)
