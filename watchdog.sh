@@ -55,19 +55,6 @@ TAIL_LINES=200
 ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
-# -------------------------
-# IMPORTANT: prevent child processes (tmux/Xvfb/java) from inheriting the lock FD
-# This fixes the "second run blocked" issue where tmux/Xvfb shows up in lsof for the lockfile.
-# -------------------------
-set_lock_cloexec() {
-  "$PYTHON_BIN" - <<'PY'
-import fcntl
-fd = 9
-flags = fcntl.fcntl(fd, fcntl.F_GETFD)
-fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-PY
-}
-
 api_ok() {
   "$PYTHON_BIN" - <<PY >/dev/null 2>&1
 from ib_insync import IB
@@ -179,10 +166,8 @@ port_listening() {
 
 dump_status_brief() {
   log "---- status (brief) ----"
-  log "Xvfb(:${DISPLAY_NUM})="\
-"$(pgrep -af "Xvfb :${DISPLAY_NUM}\b" 2>/dev/null | head -n 1 || echo 'none')"
-  log "tmux_session="\
-"$(tmux has-session -t "$TMUX_SESSION" 2>/dev/null && echo 'present' || echo 'missing')"
+  log "Xvfb(:${DISPLAY_NUM})=$(pgrep -af "Xvfb :${DISPLAY_NUM}\b" 2>/dev/null | head -n 1 || echo 'none')"
+  log "tmux_session=$(tmux has-session -t "$TMUX_SESSION" 2>/dev/null && echo 'present' || echo 'missing')"
 
   if port_listening; then
     log "port_${PORT}=LISTENING"
@@ -268,15 +253,9 @@ start_ibc_in_tmux() {
 }
 
 # =========================
-# MAIN (with lock)
+# MAIN LOGIC (no subshell FD lock)
 # =========================
-(
-  if ! flock -n 9; then
-    log "Lock busy — another watchdog run (or a child that inherited FD9) is active. Exiting."
-    exit 0
-  fi
-
-  set_lock_cloexec
+main() {
   log "Watchdog start"
 
   if api_ok; then
@@ -319,5 +298,13 @@ start_ibc_in_tmux() {
   fi
   send_fail_alert
   exit 1
+}
 
-) 9>"$LOCKFILE"
+# =========================
+# SINGLE-INSTANCE LOCK (FIXED)
+# Uses: flock --close so the lock FD cannot be inherited by tmux/java/Xvfb.
+# =========================
+if ! flock -n --close "$LOCKFILE" bash -lc "$(declare -f ts log api_ok send_fail_alert ensure_display port_listening dump_status_brief dump_status_full start_ibc_in_tmux main); main"; then
+  log "Lock busy — another watchdog run is active. Exiting."
+  exit 0
+fi
