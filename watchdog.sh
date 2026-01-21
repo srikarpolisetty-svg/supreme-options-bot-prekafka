@@ -24,7 +24,7 @@ INI="/home/ubuntu/IBC/config.ini"
 TWS_VERSION="1043"
 TMUX_KEEPALIVE_SECONDS=600
 
-# --- NEW: IBC root path (prevents default /opt/ibc) ---
+# --- IBC root path (prevents default /opt/ibc) ---
 IBC_PATH="/home/ubuntu/IBC/target/IBCLinux"
 
 # --- retries ---
@@ -41,7 +41,7 @@ XVFB_RES="1920x1080x24"
 XVFB_PIDFILE="/tmp/xvfb_${DISPLAY_NUM}.pid"
 XVFB_START_WAIT=1
 
-# --- NEW: debugging / diagnostics ---
+# --- debugging / diagnostics ---
 TMUX_START_LOG="$HOME/ib_watchdog/tmux_start_${TMUX_SESSION}.log"
 TMUX_PANE_LOG="$HOME/ib_watchdog/tmux_pane_${TMUX_SESSION}.log"
 NETSTAT_BIN="/usr/bin/ss"             # fallback to netstat if ss missing
@@ -54,6 +54,19 @@ TAIL_LINES=200
 # =========================
 ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
+
+# -------------------------
+# IMPORTANT: prevent child processes (tmux/Xvfb/java) from inheriting the lock FD
+# This fixes the "second run blocked" issue where tmux/Xvfb shows up in lsof for the lockfile.
+# -------------------------
+set_lock_cloexec() {
+  "$PYTHON_BIN" - <<'PY'
+import fcntl
+fd = 9
+flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+PY
+}
 
 api_ok() {
   "$PYTHON_BIN" - <<PY >/dev/null 2>&1
@@ -259,6 +272,7 @@ start_ibc_in_tmux() {
 # =========================
 (
   flock -n 9 || exit 0
+  set_lock_cloexec
 
   log "Watchdog start"
 
