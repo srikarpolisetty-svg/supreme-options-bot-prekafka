@@ -271,9 +271,12 @@ start_ibc_in_tmux() {
 # MAIN (with lock)
 # =========================
 (
-  flock -n 9 || exit 0
-  set_lock_cloexec
+  if ! flock -n 9; then
+    log "Lock busy — another watchdog run (or a child that inherited FD9) is active. Exiting."
+    exit 0
+  fi
 
+  set_lock_cloexec
   log "Watchdog start"
 
   if api_ok; then
