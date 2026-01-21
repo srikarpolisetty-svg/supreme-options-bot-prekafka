@@ -56,16 +56,20 @@ ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
 # =========================
-# SINGLE-INSTANCE LOCK (FIXED)
+# SINGLE-INSTANCE LOCK (FIXED + ABSOLUTE PATH)
 # - Re-execs this same script under flock so variables are not lost.
 # - Uses --close so the lock FD cannot be inherited by tmux/java/Xvfb.
+# - Uses readlink -f so cron/relative paths never break.
 # =========================
 if [[ "${WATCHDOG_UNDER_FLOCK:-0}" != "1" ]]; then
   export WATCHDOG_UNDER_FLOCK=1
-  if ! flock -n --close "$LOCKFILE" "$0" "$@"; then
+  SCRIPT_PATH="$(readlink -f "$0")"
+
+  if ! flock -n --close "$LOCKFILE" "$SCRIPT_PATH" "$@"; then
     log "Lock busy — another watchdog run is active. Exiting."
     exit 0
   fi
+
   exit 0
 fi
 
