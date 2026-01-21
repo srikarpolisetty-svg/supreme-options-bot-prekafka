@@ -55,6 +55,20 @@ TAIL_LINES=200
 ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
+# =========================
+# SINGLE-INSTANCE LOCK (FIXED)
+# - Re-execs this same script under flock so variables are not lost.
+# - Uses --close so the lock FD cannot be inherited by tmux/java/Xvfb.
+# =========================
+if [[ "${WATCHDOG_UNDER_FLOCK:-0}" != "1" ]]; then
+  export WATCHDOG_UNDER_FLOCK=1
+  if ! flock -n --close "$LOCKFILE" "$0" "$@"; then
+    log "Lock busy — another watchdog run is active. Exiting."
+    exit 0
+  fi
+  exit 0
+fi
+
 api_ok() {
   "$PYTHON_BIN" - <<PY >/dev/null 2>&1
 from ib_insync import IB
@@ -253,58 +267,47 @@ start_ibc_in_tmux() {
 }
 
 # =========================
-# MAIN LOGIC (no subshell FD lock)
+# MAIN
 # =========================
-main() {
-  log "Watchdog start"
+log "Watchdog start"
 
+if api_ok; then
+  log "OK — IB API healthy"
+  exit 0
+fi
+
+if ! ensure_display; then
+  log "FAILED — could not ensure Xvfb display"
+  send_fail_alert
+  exit 1
+fi
+
+log "IB API unhealthy — launching IBC"
+start_ibc_in_tmux
+
+sleep "$BOOT_SLEEP"
+
+for ((i=1; i<=RETRIES; i++)); do
   if api_ok; then
-    log "OK — IB API healthy"
+    log "RECOVERED — IB API healthy ($i/$RETRIES)"
     exit 0
   fi
 
-  if ! ensure_display; then
-    log "FAILED — could not ensure Xvfb display"
-    send_fail_alert
-    exit 1
+  log "Waiting for API... ($i/$RETRIES)"
+
+  if [[ "$DUMP_ON_EACH_RETRY" -eq 1 ]]; then
+    dump_status_brief
+    if ! port_listening; then
+      log "HINT: Port ${PORT} is not listening yet → IB Gateway likely not fully started/logged in."
+    fi
   fi
 
-  log "IB API unhealthy — launching IBC"
-  start_ibc_in_tmux
+  sleep "$SLEEP_BETWEEN"
+done
 
-  sleep "$BOOT_SLEEP"
-
-  for ((i=1; i<=RETRIES; i++)); do
-    if api_ok; then
-      log "RECOVERED — IB API healthy ($i/$RETRIES)"
-      exit 0
-    fi
-
-    log "Waiting for API... ($i/$RETRIES)"
-
-    if [[ "$DUMP_ON_EACH_RETRY" -eq 1 ]]; then
-      dump_status_brief
-      if ! port_listening; then
-        log "HINT: Port ${PORT} is not listening yet → IB Gateway likely not fully started/logged in."
-      fi
-    fi
-
-    sleep "$SLEEP_BETWEEN"
-  done
-
-  log "FAILED — API still unhealthy after retries"
-  if [[ "$DUMP_ON_FAILURE" -eq 1 ]]; then
-    dump_status_full
-  fi
-  send_fail_alert
-  exit 1
-}
-
-# =========================
-# SINGLE-INSTANCE LOCK (FIXED)
-# Uses: flock --close so the lock FD cannot be inherited by tmux/java/Xvfb.
-# =========================
-if ! flock -n --close "$LOCKFILE" bash -lc "$(declare -f ts log api_ok send_fail_alert ensure_display port_listening dump_status_brief dump_status_full start_ibc_in_tmux main); main"; then
-  log "Lock busy — another watchdog run is active. Exiting."
-  exit 0
+log "FAILED — API still unhealthy after retries"
+if [[ "$DUMP_ON_FAILURE" -eq 1 ]]; then
+  dump_status_full
 fi
+send_fail_alert
+exit 1
