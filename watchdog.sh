@@ -56,20 +56,23 @@ ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 
 # =========================
-# SINGLE-INSTANCE LOCK (FIXED + ABSOLUTE PATH)
-# - Re-execs this same script under flock so variables are not lost.
-# - Uses --close so the lock FD cannot be inherited by tmux/java/Xvfb.
-# - Uses readlink -f so cron/relative paths never break.
+# SINGLE-INSTANCE LOCK (NO FD INHERITANCE)
+# - execs via `flock --close` so the lock FD is never inherited by tmux/java/Xvfb
+# - uses absolute path so cron can’t break it
+# - no subshell FD-9 pattern anywhere
 # =========================
 if [[ "${WATCHDOG_UNDER_FLOCK:-0}" != "1" ]]; then
   export WATCHDOG_UNDER_FLOCK=1
   SCRIPT_PATH="$(readlink -f "$0")"
 
-  if ! flock -n --close "$LOCKFILE" "$SCRIPT_PATH" "$@"; then
+  # IMPORTANT: this requires the script to be executable:
+  # chmod +x /home/ubuntu/supreme-options-bot-prekafka/watchdog.sh
+  if ! /usr/bin/flock -n --close "$LOCKFILE" "$SCRIPT_PATH" "$@"; then
     log "Lock busy — another watchdog run is active. Exiting."
     exit 0
   fi
 
+  # parent exits; child is the real run under the lock
   exit 0
 fi
 
