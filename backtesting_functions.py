@@ -205,7 +205,7 @@ def backtest_returns_5w(
             opt_ret_next_open,
             opt_ret_1d,
             opt_ret_exp
-        FROM option_snapshots_enriched_5w
+        FROM option_snapshots_enriched
         WHERE moneyness_bucket = '{moneyness}'
           AND call_put = '{call_put}'
 

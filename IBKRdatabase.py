@@ -62,20 +62,37 @@ class App(EWrapper, EClient):
     def reset_for_symbol(self, symbol: str):
         self.symbol = symbol
 
+        # ---- underlying ----
         self.underlying_conId = None
         self.last_price = None
 
+        # ---- option chain ----
         self.expirations = set()
         self.strikes = set()
 
         self._got_underlying_price = threading.Event()
         self._got_chain = threading.Event()
 
+        # ---- option qualification ----
         self._pending_opt_qualify = {}
         self._qualified_opt_contracts = {}
+
+        # ---- IB request state ----
         self._pending_snapshot = {}
+        self._pending_contract_details = {}
         self._req_errors = {}
 
+        # ---- CRITICAL: cancel & clear old market data ----
+        try:
+            for rid in list(self.reqid_to_conid.keys()):
+                self.cancelMktData(rid)
+        except Exception:
+            pass
+
+        self.reqid_to_conid = {}
+        self.quote_by_conid = {}
+        self._pending_snapshot = {}
+        
     def tickSnapshotEnd(self, reqId: int):
         ev = self._pending_snapshot.get(reqId)
         if ev:
@@ -83,7 +100,11 @@ class App(EWrapper, EClient):
 
     def start_symbol(self, symbol: str):
         self.reset_for_symbol(symbol)
-        self.reqContractDetails(self._new_req_id(), make_stock(symbol))
+
+        rid = self._new_req_id()
+        self._pending_contract_details[rid] = threading.Event()
+
+        self.reqContractDetails(rid, make_stock(symbol))
 
     def contractDetails(self, reqId, cd):
         con = cd.contract
