@@ -1,18 +1,10 @@
 from __future__ import annotations
-from IBKRdatabase import main_parquet
 
+import argparse
+
+from databentodatabase import run_databento_option_snapshot
 from databasefunctions import get_sp500_symbols
 
-
-import argparse
-
-
-
-
-
-
-
-import argparse
 
 def main():
     # ---- shard args ----
@@ -27,26 +19,20 @@ def main():
     symbols = sorted(get_sp500_symbols())  # stable ordering
     my_symbols = symbols[args.shard::args.shards]
 
-    print(f"Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={args.run_id})")
+    print(
+        f"Shard {args.shard}/{args.shards} processing {len(my_symbols)} symbols (run_id={args.run_id})"
+    )
 
     # ---- unique client id per shard ----
     client_id = args.client_id_base + args.shard
 
     # ---- process (parquet only) ----
     try:
-        main_parquet(
-            client_id=client_id,
-            shard=args.shard,
-            run_id=args.run_id,
-            symbols=my_symbols,
-        )
+        for symbol in my_symbols:
+            run_databento_option_snapshot(args.run_id, symbol, args.shard)
     except Exception as e:
         print(f"Shard {args.shard} failed: {e}")
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-

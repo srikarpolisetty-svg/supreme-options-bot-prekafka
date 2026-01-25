@@ -18,13 +18,15 @@ if __name__ == "__main__":
         # CREATE TABLES (ALL)
         # ============================================================
 
-        # 10 MIN TABLES
+        # =========================
+        # RAW
+        # =========================
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_raw (
-                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
+                underlying_price DOUBLE,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -42,12 +44,15 @@ if __name__ == "__main__":
             );
         """)
 
+        # =========================
+        # ENRICHED
+        # =========================
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_enriched (
-                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
+                underlying_price DOUBLE,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -82,12 +87,15 @@ if __name__ == "__main__":
             );
         """)
 
+        # =========================
+        # EXECUTION SIGNALS
+        # =========================
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_execution_signals (
-                con_id BIGINT,
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
+                underlying_price DOUBLE,
                 strike DOUBLE,
                 call_put TEXT,
                 days_to_expiry INTEGER,
@@ -132,14 +140,12 @@ if __name__ == "__main__":
         # ============================================================
         # INGEST
         # ============================================================
-
         master_ingest(run_id=args.run_id)
 
         # ============================================================
         # CLEANUP (ALL)
         # ============================================================
 
-        # KEEP 35 DAYS OF DATA (single-table strategy)
         con.execute("""
             DELETE FROM option_snapshots_raw
             WHERE timestamp < NOW() - INTERVAL '35 days';
@@ -154,4 +160,3 @@ if __name__ == "__main__":
             DELETE FROM option_snapshots_execution_signals
             WHERE timestamp < NOW() - INTERVAL '35 days';
         """)
-
