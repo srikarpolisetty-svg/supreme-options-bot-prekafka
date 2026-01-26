@@ -403,39 +403,80 @@ class IBKRExecutionEngine:
 # Put this INSIDE the IBKRExecutionEngine class (replace your current _row_conid)
 # =========================
 
-    def _row_conid(self, row) -> int | None:
+    def create_conid_from_fields(
+        self,
+        symbol: str,
+        expiration_date,   # can be date or str
+        strike: float,
+        call_put: str,     # "C" or "P"
+        multiplier: str = "100",
+    ) -> int | None:
         """
-        Robust conId extraction from a pandas itertuples() row.
-        Handles attribute name mangling + None/NaN.
+        Resolve IB conId for a SPECIFIC option using option fields.
+        This is the correct way (IB doesn't take OPRA raw_symbol as contract.symbol).
+        Called ONLY after signal verification.
         """
-        d = row._asdict() if hasattr(row, "_asdict") else {}
+        try:
+            # normalize expiration -> YYYYMMDD
+            if hasattr(expiration_date, "strftime"):
+                exp = expiration_date.strftime("%Y%m%d")
+            else:
+                s = str(expiration_date).strip()
+                # "YYYY-MM-DD" -> "YYYYMMDD"
+                if "-" in s and len(s) >= 10:
+                    exp = s.replace("-", "")[:8]
+                else:
+                    exp = s[:8]
 
-        for name in (
-            "conId", "conid", "con_id",
-            "option_conId", "option_conid",
-            "contract_id", "contractId",
-        ):
-            v = d.get(name, getattr(row, name, None))
-            if v is None:
-                continue
-            try:
-                # handle NaN (float)
-                import math
-                if isinstance(v, float) and math.isnan(v):
-                    continue
-            except Exception:
-                pass
+            right = str(call_put).upper()
+            if right not in {"C", "P"}:
+                self.log("CONID_RESOLVE_BAD_RIGHT", symbol=symbol, call_put=call_put)
+                return None
 
-            try:
-                return int(v)
-            except Exception:
-                # strings like "123.0"
-                try:
-                    return int(float(str(v).strip()))
-                except Exception:
-                    continue
+            c = Contract(
+                symbol=str(symbol).upper(),
+                secType="OPT",
+                exchange="SMART",
+                currency="USD",
+                lastTradeDateOrContractMonth=exp,
+                strike=float(strike),
+                right=right,
+                multiplier=str(multiplier),
+            )
 
-        return None
+            cds = self.ib.reqContractDetails(c)
+            if not cds:
+                self.log(
+                    "CONID_RESOLVE_FAIL",
+                    symbol=symbol,
+                    exp=exp,
+                    strike=strike,
+                    right=right,
+                )
+                return None
+
+            conid = int(cds[0].contract.conId)
+            self.log(
+                "CONID_RESOLVED",
+                symbol=symbol,
+                exp=exp,
+                strike=strike,
+                right=right,
+                conid=conid,
+            )
+            return conid
+
+        except Exception as e:
+            self.log(
+                "CONID_RESOLVE_ERR",
+                symbol=symbol,
+                strike=strike,
+                call_put=call_put,
+                err=str(e),
+            )
+            return None
+
+
 # =========================
 # FIX 2) Exclude protective sells (TRAIL/STP/etc) from open-order gates
 # Add this helper INSIDE the class, then update run()
@@ -468,6 +509,7 @@ class IBKRExecutionEngine:
 # Add the helper methods anywhere INSIDE IBKRExecutionEngine (e.g., right after __init__)
 
     def log(self, event: str, **fields):
+
         # super simple prints; no structure changes elsewhere
         try:
             ts = datetime.now(self.NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -707,10 +749,18 @@ class IBKRExecutionEngine:
 
             self.log("SIGNAL_ROW", symbol=symbol, row_ts=row_ts, fired=",".join(fired))
 
-            conid = self._row_conid(row)
+
+            conid = self.create_conid_from_fields(
+                symbol=row.symbol,
+                expiration_date=row.expiration_date,
+                strike=row.strike,
+                call_put=row.call_put,
+            )
             if conid is None:
                 self.log("SIGNAL_SKIP_NO_CONID", symbol=symbol, row_ts=row_ts)
                 continue
+
+
 
             # Dedupe per run
             if conid in seen_conids:
