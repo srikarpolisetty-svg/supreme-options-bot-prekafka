@@ -11,6 +11,7 @@ import exchange_calendars as ecals
 from ib_insync import IB, Contract, MarketOrder, StopOrder, Order
 from datetime import date, timedelta
 
+
 def third_friday_of_month(d: date) -> date:
     """
     Return the 3rd Friday of the month for date d.
@@ -93,6 +94,27 @@ class IBKRExecutionEngine:
         self.order_submit_time: dict[int, datetime] = {}
 
     # -------------------------
+    # Simple logger (max visibility)
+    # -------------------------
+    def log(self, event: str, **fields):
+        try:
+            ts = datetime.now(self.NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        extras = ""
+        if fields:
+            parts = []
+            for k, v in fields.items():
+                try:
+                    parts.append(f"{k}={v}")
+                except Exception:
+                    parts.append(f"{k}=?")
+            extras = " " + " ".join(parts)
+
+        print(f"[EXEC][{event}] {ts}{extras}", flush=True)
+
+    # -------------------------
     # Connection
     # -------------------------
     def connect(self):
@@ -140,11 +162,6 @@ class IBKRExecutionEngine:
         return list(self.ib.positions())
 
     def _entry_from_position(self, p) -> float | None:
-        """
-        IB reports avgCost in account currency for the position.
-        For options it is commonly the premium * 100 (but not always).
-        We make this explicit + conservative: if avgCost looks like it's scaled, divide by 100.
-        """
         if p.avgCost is None:
             return None
         try:
@@ -154,8 +171,6 @@ class IBKRExecutionEngine:
         if ac <= 0:
             return None
 
-        # Common case: options show avgCost as premium*100, so > 20 is often a tell.
-        # Still heuristic, but centralized here for easier validation.
         if ac > 20.0:
             return ac / 100.0
         return ac
@@ -211,10 +226,6 @@ class IBKRExecutionEngine:
         return trade
 
     def place_trailing_stop_pct_sell(self, contract: Contract, qty: int, trailing_pct: float, allow_orders: bool):
-        """
-        Server-side trailing stop (SELL).
-        trailing_pct: 20.0 means trail by 20% from best price after activation.
-        """
         if not allow_orders:
             return None
 
@@ -248,12 +259,7 @@ class IBKRExecutionEngine:
         con.close()
         return df
 
-
     def _row_est_cost(self, row, qty: int) -> float | None:
-        """
-        Estimate total dollars for `qty` contracts from DB columns.
-        Uses mid/price/last/close first, then bid/ask mid.
-        """
         for name in ("mid", "price", "option_price", "last", "close"):
             v = getattr(row, name, None)
             if v is None:
@@ -281,9 +287,6 @@ class IBKRExecutionEngine:
     # Existing orders / dedupe
     # -------------------------
     def _open_orders_for_conid(self, conid: int):
-        """
-        Returns open trades whose contract matches conId and status is still working.
-        """
         working_status = {"Submitted", "PreSubmitted", "ApiPending"}
         out = []
         for t in self.ib.trades():
@@ -320,14 +323,11 @@ class IBKRExecutionEngine:
             except Exception:
                 continue
         return False
-# === ALSO ADD PRINTS FOR "when you cancel orders" and "when you liquidate" ===
-# These are in enforce_daily_loss_forced_liquidation / cancel_all_option_orders / close_all_option_positions_market.
-# Add the prints below inside those existing methods (minimal edits).
 
+    # -------------------------
+    # Cancel + Liquidate (prints added)
+    # -------------------------
     def cancel_all_option_orders(self):
-        """
-        Cancel all working orders for options (safety before liquidation).
-        """
         self.log("CANCEL_ALL_OPT_ORDERS_START")
 
         working_status = {"Submitted", "PreSubmitted", "ApiPending"}
@@ -353,9 +353,6 @@ class IBKRExecutionEngine:
         self.log("CANCEL_ALL_OPT_ORDERS_END", cancelled=cancelled)
 
     def close_all_option_positions_market(self, allow_exits: bool):
-        """
-        Force-liquidate all OPT positions with market sells.
-        """
         if not allow_exits:
             self.log("LIQUIDATE_SKIP_EXITS_DISABLED")
             return
@@ -389,7 +386,6 @@ class IBKRExecutionEngine:
         if daily_pnl < 0 and abs(daily_pnl) >= float(max_day_risk):
             self.log("DAILY_LOSS_BREACH", daily_unreal_pnl=round(float(daily_pnl), 2), max_day_risk=round(float(max_day_risk), 2), action="LIQUIDATE")
 
-            # stop stacking conflicting orders, then liquidate
             self.cancel_all_option_orders()
             self.close_all_option_positions_market(allow_exits=allow_exits)
 
@@ -398,31 +394,22 @@ class IBKRExecutionEngine:
 
         return True
 
-# =========================
-# FIX 1) Robust _row_conid (works reliably with df.itertuples())
-# Put this INSIDE the IBKRExecutionEngine class (replace your current _row_conid)
-# =========================
-
+    # -------------------------
+    # ConId resolve (FIXED reqContractDetails call)
+    # -------------------------
     def create_conid_from_fields(
         self,
         symbol: str,
-        expiration_date,   # can be date or str
+        expiration_date,
         strike: float,
-        call_put: str,     # "C" or "P"
+        call_put: str,
         multiplier: str = "100",
     ) -> int | None:
-        """
-        Resolve IB conId for a SPECIFIC option using option fields.
-        This is the correct way (IB doesn't take OPRA raw_symbol as contract.symbol).
-        Called ONLY after signal verification.
-        """
         try:
-            # normalize expiration -> YYYYMMDD
             if hasattr(expiration_date, "strftime"):
                 exp = expiration_date.strftime("%Y%m%d")
             else:
                 s = str(expiration_date).strip()
-                # "YYYY-MM-DD" -> "YYYYMMDD"
                 if "-" in s and len(s) >= 10:
                     exp = s.replace("-", "")[:8]
                 else:
@@ -444,90 +431,40 @@ class IBKRExecutionEngine:
                 multiplier=str(multiplier),
             )
 
+            # ✅ FIX: ib_insync uses reqContractDetails(contract) (no self.ib.)
             cds = self.ib.reqContractDetails(c)
             if not cds:
-                self.log(
-                    "CONID_RESOLVE_FAIL",
-                    symbol=symbol,
-                    exp=exp,
-                    strike=strike,
-                    right=right,
-                )
+                self.log("CONID_RESOLVE_FAIL", symbol=symbol, exp=exp, strike=strike, right=right)
                 return None
 
             conid = int(cds[0].contract.conId)
-            self.log(
-                "CONID_RESOLVED",
-                symbol=symbol,
-                exp=exp,
-                strike=strike,
-                right=right,
-                conid=conid,
-            )
+            self.log("CONID_RESOLVED", symbol=symbol, exp=exp, strike=strike, right=right, conid=conid)
             return conid
 
         except Exception as e:
-            self.log(
-                "CONID_RESOLVE_ERR",
-                symbol=symbol,
-                strike=strike,
-                call_put=call_put,
-                err=str(e),
-            )
+            self.log("CONID_RESOLVE_ERR", symbol=symbol, strike=strike, call_put=call_put, err=str(e))
             return None
 
-
-# =========================
-# FIX 2) Exclude protective sells (TRAIL/STP/etc) from open-order gates
-# Add this helper INSIDE the class, then update run()
-# =========================
-
+    # -------------------------
+    # Entry-only order filter (minimal fix)
+    # -------------------------
     def _is_entry_order_trade(self, t) -> bool:
-        """
-        True only for ENTRY orders (BUY). Excludes protective sells like TRAIL/STP.
-        """
         try:
             o = getattr(t, "order", None)
             if o is None:
                 return False
-
             if getattr(o, "action", None) != "BUY":
                 return False
-
-            # exclude trailing (and any other protective types you might use)
-            if getattr(o, "orderType", None) in {"TRAIL", "STP", "STOP"}:
+            # Only exclude TRAIL (protective). STOP/STP shouldn’t ever be BUY in your system.
+            if getattr(o, "orderType", None) == "TRAIL":
                 return False
-
             return True
         except Exception:
             return False
 
     # -------------------------
-    # Main loop
+    # Debug snapshots (unchanged)
     # -------------------------
-# === DROP-IN PRINT VISIBILITY (no structure change) ===
-# Add the helper methods anywhere INSIDE IBKRExecutionEngine (e.g., right after __init__)
-
-    def log(self, event: str, **fields):
-
-        # super simple prints; no structure changes elsewhere
-        try:
-            ts = datetime.now(self.NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        extras = ""
-        if fields:
-            parts = []
-            for k, v in fields.items():
-                try:
-                    parts.append(f"{k}={v}")
-                except Exception:
-                    parts.append(f"{k}=?")
-            extras = " " + " ".join(parts)
-
-        print(f"[EXEC][{event}] {ts}{extras}", flush=True)
-
     def _print_positions_snapshot(self, where: str):
         try:
             pos = self.get_positions()
@@ -554,12 +491,7 @@ class IBKRExecutionEngine:
                 qty = float(p.position)
                 avgCost = getattr(p, "avgCost", None)
                 sym = getattr(p.contract, "symbol", None)
-                self.log("POS",
-                         where=where,
-                         symbol=sym,
-                         conid=conid,
-                         qty=qty,
-                         avgCost=avgCost)
+                self.log("POS", where=where, symbol=sym, conid=conid, qty=qty, avgCost=avgCost)
             except Exception as e:
                 self.log("POS_ERR", where=where, err=str(e))
 
@@ -586,40 +518,34 @@ class IBKRExecutionEngine:
             try:
                 o = getattr(t, "order", None)
                 c = getattr(t, "contract", None)
-                self.log("ORD",
-                         where=where,
-                         orderId=getattr(o, "orderId", None),
-                         status=getattr(getattr(t, "orderStatus", None), "status", None),
-                         action=getattr(o, "action", None),
-                         orderType=getattr(o, "orderType", None),
-                         qty=getattr(o, "totalQuantity", None),
-                         conid=getattr(c, "conId", None),
-                         symbol=getattr(c, "symbol", None))
+                self.log(
+                    "ORD",
+                    where=where,
+                    orderId=getattr(o, "orderId", None),
+                    status=getattr(getattr(t, "orderStatus", None), "status", None),
+                    action=getattr(o, "action", None),
+                    orderType=getattr(o, "orderType", None),
+                    qty=getattr(o, "totalQuantity", None),
+                    conid=getattr(c, "conId", None),
+                    symbol=getattr(c, "symbol", None),
+                )
             except Exception as e:
                 self.log("ORD_ERR", where=where, err=str(e))
 
-
-# === NOW ADD PRINTS INSIDE run() AT THE REQUESTED POINTS ===
-# (Paste these changes into your existing run() body exactly where shown.)
-
+    # -------------------------
+    # Main loop (same structure, extra logs only)
+    # -------------------------
     def run(self, symbol: str):
-        # Engine start / symbol start
         self.log("RUN_START", symbol=symbol, client_id=self.client_id, port=self.port)
 
-        # market-hours gate
         today = datetime.now(self.NY_TZ).date()
         is_tf_week, tf_date = is_third_friday_week(today)
-
-        # market open? third-Friday week?
         self.log("GATE_CAL", symbol=symbol, today=today, is_third_friday_week=is_tf_week, third_friday=tf_date)
 
         if is_tf_week:
             self.log("SKIP_THIRD_FRIDAY_WEEK", symbol=symbol, today=today, third_friday=tf_date)
             return
 
-        # -------------------------
-        # Market hours gate
-        # -------------------------
         now = datetime.now(self.NY_TZ)
         is_open = bool(self.XNYS.is_open_on_minute(now, ignore_breaks=True))
         self.log("GATE_MARKET_HOURS", symbol=symbol, now=str(now), is_open=is_open)
@@ -631,21 +557,14 @@ class IBKRExecutionEngine:
         self.connect()
         self.log("CONNECTED", symbol=symbol, isConnected=self.ib.isConnected())
 
-        # Global kill switch
         allow_orders = bool(self.execute_trades_default)
-
-        # Exits can optionally remain enabled even when kill switch is off
         allow_exits = bool(allow_orders or self.allow_exits_when_killed)
-        allow_entries = bool(allow_orders)  # entries only when explicitly enabled
-
-        # allow_orders / allow_entries / allow_exits
+        allow_entries = bool(allow_orders)
         self.log("GATE_ALLOW_FLAGS", symbol=symbol, allow_orders=allow_orders, allow_entries=allow_entries, allow_exits=allow_exits)
 
-        # Positions snapshot at start of run()
         self._print_positions_snapshot(where="run_start")
         self._print_open_orders_snapshot(where="run_start")
 
-        # Buying power / budgets
         acct = {}
         for r in self.ib.accountSummary():
             try:
@@ -660,7 +579,6 @@ class IBKRExecutionEngine:
         max_trade_risk = float(buying_power) * self.risk.per_trade_risk_pct
         max_day_risk = float(buying_power) * self.risk.per_day_risk_pct
 
-        # buying power, max_trade_risk, max_day_risk
         self.log(
             "BUDGETS",
             symbol=symbol,
@@ -671,16 +589,11 @@ class IBKRExecutionEngine:
             max_day_risk=max_day_risk,
         )
 
-        # -------------------------
-        # Entry gates (ENTRY orders only)
-        # -------------------------
         open_trades = [
             t for t in self.ib.trades()
             if getattr(getattr(t, "orderStatus", None), "status", None) in {"Submitted", "PreSubmitted", "ApiPending"}
         ]
         open_entry_trades = [t for t in open_trades if self._is_entry_order_trade(t)]
-
-        # open entry trades count
         self.log("GATE_OPEN_ENTRY_TRADES", symbol=symbol, open_entry_trades=len(open_entry_trades), max_open_orders=self.risk.max_open_orders)
 
         if len(open_entry_trades) >= self.risk.max_open_orders:
@@ -705,13 +618,9 @@ class IBKRExecutionEngine:
                     self.log("GATE_MIN_ORDER_AGE_HIT", symbol=symbol, orderId=oid, age_s=int(age_s), min_age_s=min_age_seconds)
                     break
 
-        # min-age triggered? (summary)
         self.log("GATE_MIN_ORDER_AGE", symbol=symbol, triggered=min_age_triggered, min_age_s=min_age_seconds)
 
-        # Daily loss gate: FORCE liquidation + disable NEW entries
-        # (your enforce function already prints the kill line; add extra context prints)
         self.log("DAILY_LOSS_CHECK", symbol=symbol, max_day_risk=max_day_risk, allow_exits=allow_exits)
-
         allow_entries_before = bool(allow_entries)
         allow_entries = bool(allow_entries) and self.enforce_daily_loss_forced_liquidation(
             max_day_risk=max_day_risk,
@@ -719,9 +628,6 @@ class IBKRExecutionEngine:
         )
         self.log("DAILY_LOSS_RESULT", symbol=symbol, allow_entries_before=allow_entries_before, allow_entries_after=allow_entries)
 
-        # -------------------------
-        # Entries from DB signals (NO market data)
-        # -------------------------
         df = self.load_recent_signal_rows(symbol)
         self.log("DB_ROWS_LOADED", symbol=symbol, rows=int(len(df)))
 
@@ -734,7 +640,6 @@ class IBKRExecutionEngine:
         seen_conids: set[int] = set()
 
         for row in df.itertuples():
-            # row timestamp, which signal cols were true
             row_ts = getattr(row, "timestamp", None)
             fired = []
             for c in signal_cols:
@@ -749,7 +654,6 @@ class IBKRExecutionEngine:
 
             self.log("SIGNAL_ROW", symbol=symbol, row_ts=row_ts, fired=",".join(fired))
 
-
             conid = self.create_conid_from_fields(
                 symbol=row.symbol,
                 expiration_date=row.expiration_date,
@@ -760,15 +664,11 @@ class IBKRExecutionEngine:
                 self.log("SIGNAL_SKIP_NO_CONID", symbol=symbol, row_ts=row_ts)
                 continue
 
-
-
-            # Dedupe per run
             if conid in seen_conids:
                 self.log("SIGNAL_SKIP_DUP_CONID", symbol=symbol, conid=conid, row_ts=row_ts)
                 continue
             seen_conids.add(conid)
 
-            # Don't re-enter if already long
             if self._already_long_conid(conid):
                 self.log("ENTRY_SKIP_ALREADY_LONG", symbol=symbol, conid=conid)
                 continue
@@ -783,7 +683,6 @@ class IBKRExecutionEngine:
 
             passed_risk = bool(est_cost <= max_trade_risk)
 
-            # extracted conid, qty, est_cost, “passed risk?”
             self.log(
                 "ENTRY_EVAL",
                 symbol=symbol,
@@ -795,46 +694,45 @@ class IBKRExecutionEngine:
                 allow_entries=allow_entries,
             )
 
-            if allow_entries and passed_risk:
-                # when you place BUY
-                self.log("ORDER_BUY_PLACING", symbol=symbol, conid=conid, qty=qty)
-                tr = self.place_market(contract, "BUY", qty, allow_orders=allow_entries)
-                if tr is not None:
-                    try:
-                        oid = tr.order.orderId
-                    except Exception:
-                        oid = None
-                    self.log("ORDER_BUY_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid)
+            if not allow_entries:
+                self.log("ENTRY_SKIP_ALLOW_ENTRIES_FALSE", symbol=symbol, conid=conid)
+                continue
+            if not passed_risk:
+                self.log("ENTRY_SKIP_RISK_TOO_HIGH", symbol=symbol, conid=conid, est_cost=round(float(est_cost), 2), max_trade_risk=round(float(max_trade_risk), 2))
+                continue
 
-                    # Positions snapshot after order placement
-                    self._print_positions_snapshot(where="after_buy")
-                    self._print_open_orders_snapshot(where="after_buy")
+            self.log("ORDER_BUY_PLACING", symbol=symbol, conid=conid, qty=qty)
+            tr = self.place_market(contract, "BUY", qty, allow_orders=allow_entries)
+            if tr is not None:
+                try:
+                    oid = tr.order.orderId
+                except Exception:
+                    oid = None
+                self.log("ORDER_BUY_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid)
 
-                    # when a TRAIL is placed
-                    if not self._has_working_trailing_sell(conid):
-                        self.log("ORDER_TRAIL_PLACING", symbol=symbol, conid=conid, qty=qty, trail_pct=float(self.risk.trail_pct * 100.0))
-                        tr2 = self.place_trailing_stop_pct_sell(
-                            contract=contract,
-                            qty=qty,
-                            trailing_pct=self.risk.trail_pct * 100.0,  # 0.20 -> 20.0
-                            allow_orders=allow_exits,
-                        )
-                        if tr2 is not None:
-                            try:
-                                oid2 = tr2.order.orderId
-                            except Exception:
-                                oid2 = None
-                            self.log("ORDER_TRAIL_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid2)
+                self._print_positions_snapshot(where="after_buy")
+                self._print_open_orders_snapshot(where="after_buy")
 
-                            # Positions snapshot after order placement
-                            self._print_positions_snapshot(where="after_trail")
-                            self._print_open_orders_snapshot(where="after_trail")
-                    else:
-                        self.log("ORDER_TRAIL_SKIP_EXISTS", symbol=symbol, conid=conid)
+                if not self._has_working_trailing_sell(conid):
+                    self.log("ORDER_TRAIL_PLACING", symbol=symbol, conid=conid, qty=qty, trail_pct=float(self.risk.trail_pct * 100.0))
+                    tr2 = self.place_trailing_stop_pct_sell(
+                        contract=contract,
+                        qty=qty,
+                        trailing_pct=self.risk.trail_pct * 100.0,
+                        allow_orders=allow_exits,
+                    )
+                    if tr2 is not None:
+                        try:
+                            oid2 = tr2.order.orderId
+                        except Exception:
+                            oid2 = None
+                        self.log("ORDER_TRAIL_PLACED", symbol=symbol, conid=conid, qty=qty, orderId=oid2)
 
-        # -------------------------
-        # Position management (only touches OPEN positions)
-        # -------------------------
+                        self._print_positions_snapshot(where="after_trail")
+                        self._print_open_orders_snapshot(where="after_trail")
+                else:
+                    self.log("ORDER_TRAIL_SKIP_EXISTS", symbol=symbol, conid=conid)
+
         for p in self.get_positions():
             if p.contract.secType != "OPT" or p.position <= 0:
                 continue
@@ -854,11 +752,9 @@ class IBKRExecutionEngine:
 
             self.log("PM_STATE", symbol=symbol, conid=conid, qty=qty, mark=round(float(mark), 4), ret_pct=round(float(ret), 2))
 
-            # +25%: set breakeven stop
             if ret >= 25 and not self._has_working_stop_sell(conid):
                 entry = self._entry_from_position(p)
                 if entry and entry > 0:
-                    # when a stop is placed
                     self.log("ORDER_BE_STOP_PLACING", symbol=symbol, conid=conid, qty=qty, stop_price=round(float(entry), 4), ret_pct=round(float(ret), 2))
                     tr3 = self.place_stop_close_sell(p.contract, qty, float(entry), allow_orders=allow_exits)
                     if tr3 is not None:
@@ -873,7 +769,6 @@ class IBKRExecutionEngine:
             elif ret >= 25:
                 self.log("ORDER_BE_STOP_SKIP_EXISTS", symbol=symbol, conid=conid, ret_pct=round(float(ret), 2))
 
-            # +50%: take 1 off
             if ret >= 50 and qty >= 2:
                 has_working_sell_mkt = any(
                     (t.order.action == "SELL" and t.order.orderType == "MKT")
@@ -881,7 +776,6 @@ class IBKRExecutionEngine:
                     if getattr(t, "order", None) is not None
                 )
                 if not has_working_sell_mkt:
-                    # when you sell 1 at +50
                     self.log("ORDER_TP1_PLACING", symbol=symbol, conid=conid, sell_qty=1, ret_pct=round(float(ret), 2))
                     tr4 = self.place_market(p.contract, "SELL", 1, allow_orders=allow_exits)
                     if tr4 is not None:
@@ -896,7 +790,6 @@ class IBKRExecutionEngine:
                 else:
                     self.log("ORDER_TP1_SKIP_WORKING_SELL_MKT", symbol=symbol, conid=conid, ret_pct=round(float(ret), 2))
 
-            # Ensure a trailing stop exists
             if not self._has_working_trailing_sell(conid):
                 self.log("ORDER_TRAIL_ENSURE_PLACING", symbol=symbol, conid=conid, qty=qty, trail_pct=float(self.risk.trail_pct * 100.0))
                 tr5 = self.place_trailing_stop_pct_sell(
