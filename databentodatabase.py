@@ -21,7 +21,7 @@ def run_databento_option_snapshot(run_id: str, symbol: str, shard_id: int):
         dataset="EQUS.MINI",  # common US equities dataset
         schema="ohlcv-1m",
         symbols=[symbol],
-        start=(now - dt.timedelta(minutes=2)).isoformat(),
+        start=(now - dt.timedelta(minutes=11)).isoformat(),
         end=now.isoformat(),
     )
 
