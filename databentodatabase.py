@@ -13,7 +13,7 @@ from config import DATABENTO_API_KEY
 
 
 def run_databento_option_snapshot(run_id: str, symbol: str, shard_id: int):
-    client = db.Historical(api_key=DATABENTO_API_KEY)  # uses DATABENTO_API_KEY env var
+    client = db.Historical(DATABENTO_API_KEY)  # uses DATABENTO_API_KEY env var
 
     now = dt.datetime.now(tz=pytz.UTC)
 
