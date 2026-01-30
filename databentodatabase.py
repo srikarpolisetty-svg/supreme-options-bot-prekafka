@@ -17,13 +17,19 @@ def run_databento_option_snapshot(run_id: str, symbol: str, shard_id: int):
 
     now = dt.datetime.now(tz=pytz.UTC)
 
+    buffer_minutes = 10  # safe lag behind real time
+
+    safe_end = now - dt.timedelta(minutes=buffer_minutes)
+    safe_start = safe_end - dt.timedelta(minutes=2)  # your 2-minute slice
+
     data = client.timeseries.get_range(
-        dataset="EQUS.MINI",  # common US equities dataset
+        dataset="EQUS.MINI",
         schema="ohlcv-1m",
         symbols=[symbol],
-        start=(now - dt.timedelta(minutes=11)).isoformat(),
-        end=now.isoformat(),
+        start=safe_start.isoformat(),
+        end=safe_end.isoformat(),
     )
+
 
     df = data.to_df()
     underlying_price = float(df["close"].iloc[-1])
