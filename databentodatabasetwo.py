@@ -438,28 +438,30 @@ def run_symbol(symbol: str, run_id: str, shard_id: int):
 
 
 # ---------- MAIN ----------
-RUN_ID = "r001"
-SHARD_ID = 0
-N_SHARDS = 8
+
 # -------------------
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-id", default="r001")
+    parser.add_argument("--shard-id", type=int, required=True)
+    parser.add_argument("--n-shards", type=int, required=True)
+    args = parser.parse_args()
+
     ensure_table()
 
     symbols = get_sp500_symbols()
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
 
     # only run symbols that belong to this shard
-    my_symbols = [s for s in symbols if stable_shard(s, N_SHARDS) == SHARD_ID]
+    my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
-    print(f"[INFO] run_id={RUN_ID} shard={SHARD_ID}/{N_SHARDS} symbols={len(my_symbols)}")
+    print(f"[INFO] run_id={args.run_id} shard={args.shard_id}/{args.n_shards} symbols={len(my_symbols)}")
 
     for sym in my_symbols:
         try:
-            run_symbol(sym, RUN_ID, SHARD_ID)
+            run_symbol(sym, args.run_id, args.shard_id)
         except Exception as e:
             print(f"❌ {sym}: error -> {e}")
-
-
-if __name__ == "__main__":
-    main()
