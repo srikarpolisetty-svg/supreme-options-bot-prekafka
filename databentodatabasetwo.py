@@ -465,3 +465,7 @@ def main():
             run_symbol(sym, args.run_id, args.shard_id)
         except Exception as e:
             print(f"❌ {sym}: error -> {e}")
+
+
+if __name__ == "__main__":
+    main()
