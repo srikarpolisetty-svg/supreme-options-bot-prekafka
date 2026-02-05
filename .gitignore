@@ -1,16 +1,21 @@
+# env / secrets
 .env
+
+# databases
 options_data.db
+*.db
+
+# binaries / zips
 duckdb_cli-linux-amd64.zip
 
+# python junk
 __pycache__/
 *.pyc
 
-# Pipeline outputs
+# logs
+logs/
+*.log
+
+# pipeline outputs
 runs/
 *.parquet
-
-# Databases (DuckDB)
-*.db
-
-
->>>>>>> Stashed changes
