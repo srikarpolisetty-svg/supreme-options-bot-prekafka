@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 # ---- CONFIG ----
 RUN_ID="r001"
-N_SHARDS=4
+N_SHARDS=8
 LOG_DIR="logs"
 # ----------------
 
