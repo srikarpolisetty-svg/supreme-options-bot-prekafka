@@ -570,6 +570,11 @@ def run_symbol(symbol: str, days_back: int = 35):
         else:
             oi_df_win = pd.DataFrame()
 
+        # ✅ NEW: avoid SettingWithCopyWarning when _ensure_utc_col mutates
+        mkt_df_win = mkt_df_win.copy()
+        trd_df_win = trd_df_win.copy()
+        oi_df_win  = oi_df_win.copy()
+
         for ts, (underlying_price, days_till_expiry, exp_date, strike_sides) in per_ts.items():
             if days_till_expiry <= 1:
                 time_decay_bucket = "EXTREME"
