@@ -16,7 +16,7 @@ echo "Starting options pipeline | run_id=$RUN_ID | shards=$N_SHARDS"
 for (( i=0; i<$N_SHARDS; i++ ))
 do
   echo "Launching shard $i"
-  python databentodatabasetwo.py \
+  python databentodatabasebackfill.py \
     --run-id $RUN_ID \
     --shard-id $i \
     --n-shards $N_SHARDS \

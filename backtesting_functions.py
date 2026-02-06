@@ -33,6 +33,62 @@ def backtest_signal(
     return con.execute(query).df()
 
 
+def query_snapshots(
+    con,
+    moneyness: str,
+    call_put: str,
+
+    strike_min: float | None = None,
+    strike_max: float | None = None,
+
+    dte_min: int | None = None,
+    dte_max: int | None = None,
+
+    volume_min: int | None = None,
+    volume_max: int | None = None,
+
+    iv_min: float | None = None,
+    iv_max: float | None = None,
+
+    time_decay_bucket: str | None = None,
+):
+    query = f"""
+        SELECT
+            timestamp,
+            symbol,
+            strike,
+            call_put,
+            moneyness_bucket,
+            bid,
+            ask,
+            mid,
+            volume,
+            open_interest,
+            iv,
+            spread,
+            spread_pct,
+            days_to_expiry,
+            expiration_date,
+            time_decay_bucket
+        FROM option_snapshots_raw
+        WHERE moneyness_bucket = '{moneyness}'
+          AND call_put = '{call_put}'
+
+          {f"AND strike >= {strike_min}" if strike_min is not None else ""}
+          {f"AND strike <= {strike_max}" if strike_max is not None else ""}
+
+          {f"AND days_to_expiry >= {dte_min}" if dte_min is not None else ""}
+          {f"AND days_to_expiry <= {dte_max}" if dte_max is not None else ""}
+
+          {f"AND volume >= {volume_min}" if volume_min is not None else ""}
+          {f"AND volume <= {volume_max}" if volume_max is not None else ""}
+
+          {f"AND iv >= {iv_min}" if iv_min is not None else ""}
+          {f"AND iv <= {iv_max}" if iv_max is not None else ""}
+
+          {f"AND time_decay_bucket = '{time_decay_bucket}'" if time_decay_bucket else ""}
+    """
+    return con.execute(query).df()
 
 
 
@@ -97,7 +153,7 @@ def backtest_returns(
             opt_ret_next_open,
             opt_ret_1d,
             opt_ret_exp
-        FROM option_snapshots_enriched
+        FROM option_snapshots_enriched 
         WHERE moneyness_bucket = '{moneyness}'
           AND call_put = '{call_put}'
 
@@ -251,3 +307,6 @@ def backtest_returns_5w(
           {f"AND iv_z <= {iv_z_max}" if iv_z_max is not None else ""}
     """
     return con.execute(query).df()
+
+
+
