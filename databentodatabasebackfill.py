@@ -39,9 +39,6 @@ def ensure_table():
     try:
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_raw (
-                run_id TEXT,
-                shard_id INTEGER,
-
                 snapshot_id TEXT,
                 timestamp TIMESTAMP,
                 symbol TEXT,
@@ -179,13 +176,10 @@ def batch_get_df_chunked(
 
 # ---------- HELPERS ----------
 def append_row(
-    results, run_id, shard_id, snapshot_id, ts, symbol, underlying_price, days_till_expiry, exp_date,
+    results, snapshot_id, ts, symbol, underlying_price, days_till_expiry, exp_date,
     time_decay_bucket, strike, bucket, side, bid, ask, mid, vol, oi, iv, spread, spread_pct
 ):
     results.append({
-        "run_id": run_id,
-        "shard_id": shard_id,
-
         "snapshot_id": snapshot_id,
         "timestamp": ts,
         "symbol": symbol,
@@ -423,7 +417,7 @@ def fetch_last_days(symbol: str, days: int):
 
 
 # ---------- ONE SYMBOL ----------
-def run_symbol(symbol: str, run_id: str, shard_id: int, days_back: int = 35):
+def run_symbol(symbol: str, days_back: int = 35):
     data = fetch_last_days(symbol, days_back)
     if data is None or data.empty:
         print(f"⏭️ {symbol}: no underlying data")
@@ -615,7 +609,7 @@ def run_symbol(symbol: str, run_id: str, shard_id: int, days_back: int = 35):
                     bucket = "OTM_2"
 
                 append_row(
-                    results, run_id, shard_id,
+                    results,
                     snapshot_id, ts, symbol, underlying_price,
                     days_till_expiry, exp_date, time_decay_bucket,
                     strike, bucket, side,
@@ -640,13 +634,12 @@ def run_symbol(symbol: str, run_id: str, shard_id: int, days_back: int = 35):
     finally:
         con.close()
 
-    print(f"✅ {symbol}: inserted {len(df):,} rows | run_id={run_id} shard={shard_id}")
+    print(f"✅ {symbol}: inserted {len(df):,} rows")
 
 
 # ---------- MAIN ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-id", default="r001")
     parser.add_argument("--shard-id", type=int, required=True)
     parser.add_argument("--n-shards", type=int, required=True)
     parser.add_argument("--days-back", type=int, default=35)
@@ -658,11 +651,11 @@ def main():
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
     my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
-    print(f"[INFO] run_id={args.run_id} shard={args.shard_id}/{args.n_shards} symbols={len(my_symbols)} days_back={args.days_back}")
+    print(f"[INFO] shard={args.shard_id}/{args.n_shards} symbols={len(my_symbols)} days_back={args.days_back}")
 
     for sym in my_symbols:
         try:
-            run_symbol(sym, args.run_id, args.shard_id, days_back=args.days_back)
+            run_symbol(sym, days_back=args.days_back)
         except Exception as e:
             print(f"❌ {sym}: error -> {e}")
 
