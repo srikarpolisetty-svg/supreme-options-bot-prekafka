@@ -17,7 +17,6 @@ for (( i=0; i<$N_SHARDS; i++ ))
 do
   echo "Launching shard $i"
   python databentodatabasebackfill.py \
-    --run-id $RUN_ID \
     --shard-id $i \
     --n-shards $N_SHARDS \
     > $LOG_DIR/shard_$i.log 2>&1 &
