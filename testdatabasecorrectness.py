@@ -309,12 +309,13 @@ def main():
     start_db = start_utc.replace(tzinfo=None)
     end_db = end_utc.replace(tzinfo=None)
 
-    symbols = get_all_symbols()
-    symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
-    print(f"[INFO] symbols_from_db={len(symbols)}")
-
     con = duckdb.connect(DB_PATH, read_only=True)
     try:
+        # ✅ FIX: get symbols from DB using the open connection
+        symbols = get_all_symbols(con)
+        symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
+        print(f"[INFO] symbols_from_db={len(symbols)}")
+
         for symbol in symbols:
             symbol = symbol.strip().upper()
 
@@ -546,6 +547,9 @@ def main():
 
     finally:
         con.close()
+
+
+        
 
 if __name__ == "__main__":
     main()
