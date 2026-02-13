@@ -47,7 +47,8 @@ client = db.Historical(DATABENTO_API_KEY)
 # TIME / CAST HELPERS
 # ==============================
 def db_end_utc_day() -> datetime:
-    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return now - timedelta(days=1)
 
 def to_utc_ts(x) -> pd.Timestamp:
     ts = pd.Timestamp(x)
