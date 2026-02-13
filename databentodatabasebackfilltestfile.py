@@ -71,11 +71,11 @@ class Timer:
 # ---------- TIME RANGE (Databento-safe end boundary) ----------
 def db_end_utc_day() -> datetime:
     """
-    Databento historical often seals availability at 00:00:00 UTC boundaries.
-    Using 'now()' can exceed the available end and trigger 422.
-    Clamp end to the start of the current UTC day.
+    Use a 1-day buffer to avoid Databento 'end after available end' (422).
+    Returns start of yesterday (00:00:00 UTC).
     """
-    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_utc_0 = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return today_utc_0 - timedelta(days=1)
 
 
 # ---------- DB ----------
