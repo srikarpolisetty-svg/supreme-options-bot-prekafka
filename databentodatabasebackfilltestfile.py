@@ -924,7 +924,13 @@ def main():
 
     ensure_table()
 
-    symbols = get_all_symbolsTester()
+    # get symbols from DB (requires a connection)
+    con = duckdb.connect(DB_PATH, read_only=True)
+    try:
+        symbols = get_all_symbolsTester(con)   # <-- pass con
+    finally:
+        con.close()
+
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
     my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
@@ -940,7 +946,6 @@ def main():
         dry_run=args.dry_run,
         debug_dump=args.debug_dump,
     )
-
 
 if __name__ == "__main__":
     main()
