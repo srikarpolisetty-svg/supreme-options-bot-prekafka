@@ -5,7 +5,8 @@ from config import DATABENTO_API_KEY
 import duckdb
 import math
 from execution_functions import get_all_symbols
-
+import os
+import traceback
 
 # ==============================
 # CONFIG
@@ -312,40 +313,119 @@ def main():
     con = duckdb.connect(DB_PATH, read_only=True)
     try:
         # ✅ FIX: get symbols from DB using the open connection
-        symbols = get_all_symbols(con)
+        try:
+            symbols = get_all_symbols(con)
+        except Exception as e:
+            print("\n[ERROR] get_all_symbols(con) crashed:")
+            print(" ", repr(e))
+            print(traceback.format_exc())
+            raise
+
         symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
         print(f"[INFO] symbols_from_db={len(symbols)}")
+
+        # 🚨 HARD FAIL + DB DIAGNOSTICS if empty (no silent success)
+        if len(symbols) == 0:
+            print("\n[ERROR] symbols_from_db == 0. Dumping DB diagnostics...\n")
+            try:
+                import os
+                print(f"[DIAG] cwd={os.getcwd()}")
+                print(f"[DIAG] DB_PATH={DB_PATH}")
+            except Exception:
+                pass
+
+            try:
+                tables = con.execute("SHOW TABLES").df()
+                print(f"[DIAG] SHOW TABLES:\n{tables}")
+            except Exception as e:
+                print(f"[DIAG] SHOW TABLES failed: {repr(e)}")
+                print(traceback.format_exc())
+
+            try:
+                cnt = con.execute("SELECT COUNT(*) AS n FROM option_snapshots_raw").df()
+                print(f"[DIAG] option_snapshots_raw rowcount:\n{cnt}")
+            except Exception as e:
+                print(f"[DIAG] COUNT(*) on option_snapshots_raw failed: {repr(e)}")
+                print(traceback.format_exc())
+
+            try:
+                sym_cnt = con.execute(
+                    "SELECT symbol, COUNT(*) AS n FROM option_snapshots_raw GROUP BY symbol ORDER BY n DESC LIMIT 20"
+                ).df()
+                print(f"[DIAG] top symbols by rows (limit 20):\n{sym_cnt}")
+            except Exception as e:
+                print(f"[DIAG] symbol grouping query failed: {repr(e)}")
+                print(traceback.format_exc())
+
+            try:
+                rng = con.execute(
+                    "SELECT MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts FROM option_snapshots_raw"
+                ).df()
+                print(f"[DIAG] timestamp range in DB:\n{rng}")
+            except Exception as e:
+                print(f"[DIAG] timestamp range query failed: {repr(e)}")
+                print(traceback.format_exc())
+
+            try:
+                inwin = con.execute(
+                    """
+                    SELECT COUNT(*) AS n_in_window
+                    FROM option_snapshots_raw
+                    WHERE timestamp >= ? AND timestamp < ?
+                    """,
+                    [start_db, end_db],
+                ).df()
+                print(f"[DIAG] rows in window [{start_db} .. {end_db}):\n{inwin}")
+            except Exception as e:
+                print(f"[DIAG] window count query failed: {repr(e)}")
+                print(traceback.format_exc())
+
+            raise RuntimeError("No symbols found in DB (see diagnostics above).")
 
         for symbol in symbols:
             symbol = symbol.strip().upper()
 
-            def_map = build_def_map(symbol, start_utc, end_utc)
+            try:
+                def_map = build_def_map(symbol, start_utc, end_utc)
+            except Exception as e:
+                print(f"\n[ERROR] build_def_map failed for {symbol}:")
+                print(" ", repr(e))
+                print(traceback.format_exc())
+                continue
+
             if not def_map:
                 print(f"[SKIP] {symbol}: no OPRA definitions -> cannot map raw_symbol")
                 continue
+
             print(f"\n[INFO] validate symbol={symbol} days_back={DAYS_BACK}")
             print(f"[INFO] def_map keys={len(def_map):,}")
 
-            ts_df = con.execute(
-                """
-                WITH t AS (
-                  SELECT DISTINCT timestamp
-                  FROM option_snapshots_raw
-                  WHERE symbol = ?
-                    AND timestamp >= ?
-                    AND timestamp < ?
-                  ORDER BY timestamp
-                ),
-                u AS (
-                  SELECT timestamp, row_number() OVER (ORDER BY timestamp) AS rn
-                  FROM t
-                )
-                SELECT timestamp
-                FROM u
-                WHERE (rn - 1) % ? = 0
-                """,
-                [symbol, start_db, end_db, EVERY_NTH_TIMESTAMP],
-            ).df()
+            try:
+                ts_df = con.execute(
+                    """
+                    WITH t AS (
+                      SELECT DISTINCT timestamp
+                      FROM option_snapshots_raw
+                      WHERE symbol = ?
+                        AND timestamp >= ?
+                        AND timestamp < ?
+                      ORDER BY timestamp
+                    ),
+                    u AS (
+                      SELECT timestamp, row_number() OVER (ORDER BY timestamp) AS rn
+                      FROM t
+                    )
+                    SELECT timestamp
+                    FROM u
+                    WHERE (rn - 1) % ? = 0
+                    """,
+                    [symbol, start_db, end_db, EVERY_NTH_TIMESTAMP],
+                ).df()
+            except Exception as e:
+                print(f"[ERROR] timestamp query failed for {symbol}:")
+                print(" ", repr(e))
+                print(traceback.format_exc())
+                continue
 
             if ts_df is None or ts_df.empty:
                 print(f"[SKIP] {symbol}: no timestamps found in DB for this symbol in this window")
@@ -363,29 +443,36 @@ def main():
                 ts = to_utc_ts(ts)
                 ts_db = to_utc_naive_dt(ts)
 
-                rows = con.execute(
-                    """
-                    SELECT
-                      timestamp,
-                      underlying_price,
-                      strike,
-                      call_put,
-                      days_to_expiry,
-                      expiration_date,
-                      bid,
-                      ask,
-                      mid,
-                      volume,
-                      open_interest,
-                      iv,
-                      spread,
-                      spread_pct
-                    FROM option_snapshots_raw
-                    WHERE symbol = ? AND timestamp = ?
-                    ORDER BY strike, call_put
-                    """,
-                    [symbol, ts_db],
-                ).df()
+                try:
+                    rows = con.execute(
+                        """
+                        SELECT
+                          timestamp,
+                          underlying_price,
+                          strike,
+                          call_put,
+                          days_to_expiry,
+                          expiration_date,
+                          bid,
+                          ask,
+                          mid,
+                          volume,
+                          open_interest,
+                          iv,
+                          spread,
+                          spread_pct
+                        FROM option_snapshots_raw
+                        WHERE symbol = ? AND timestamp = ?
+                        ORDER BY strike, call_put
+                        """,
+                        [symbol, ts_db],
+                    ).df()
+                except Exception as e:
+                    print(f"[{i:02d}] {ts.isoformat()} -> FAIL (DB row query crashed)")
+                    print(" ", repr(e))
+                    print(traceback.format_exc())
+                    fail_ct += 1
+                    continue
 
                 if rows is None or rows.empty:
                     print(f"[{i:02d}] {ts.isoformat()} -> FAIL (no DB rows)")
@@ -397,7 +484,10 @@ def main():
                     up = rows["underlying_price"].iloc[0] if "underlying_price" in rows.columns else None
                     dte0 = rows["days_to_expiry"].iloc[0] if "days_to_expiry" in rows.columns else None
                     exp0 = rows["expiration_date"].iloc[0] if "expiration_date" in rows.columns else None
-                    print(f"\n[{i:02d}] TS={ts.isoformat()} | db_rows={len(rows)} | underlying_price={up} | days_to_expiry={dte0} | expiration_date={exp0}")
+                    print(
+                        f"\n[{i:02d}] TS={ts.isoformat()} | db_rows={len(rows)} | "
+                        f"underlying_price={up} | days_to_expiry={dte0} | expiration_date={exp0}"
+                    )
 
                 if PRINT_DB_ROWS_PREVIEW:
                     print("[DB RAW PREVIEW] first 5 rows dicts:")
@@ -417,15 +507,33 @@ def main():
 
                 raw_symbols = sorted(set(raw_symbols))
 
-                # API pulls for this timestamp
-                live_quotes = pull_cbbo_last_le_many(raw_symbols, ts)
-                live_vols = pull_trades_volume_window_many(raw_symbols, ts)
-                live_ois = pull_oi_last_le_many(raw_symbols, ts)
+                # API pulls for this timestamp (print errors instead of silent {})
+                try:
+                    live_quotes = pull_cbbo_last_le_many(raw_symbols, ts)
+                except Exception as e:
+                    print(f"[{i:02d}] {ts.isoformat()} -> ERROR pull_cbbo_last_le_many:")
+                    print(" ", repr(e))
+                    print(traceback.format_exc())
+                    live_quotes = {}
+
+                try:
+                    live_vols = pull_trades_volume_window_many(raw_symbols, ts)
+                except Exception as e:
+                    print(f"[{i:02d}] {ts.isoformat()} -> ERROR pull_trades_volume_window_many:")
+                    print(" ", repr(e))
+                    print(traceback.format_exc())
+                    live_vols = {}
+
+                try:
+                    live_ois = pull_oi_last_le_many(raw_symbols, ts)
+                except Exception as e:
+                    print(f"[{i:02d}] {ts.isoformat()} -> ERROR pull_oi_last_le_many:")
+                    print(" ", repr(e))
+                    print(traceback.format_exc())
+                    live_ois = {}
 
                 ok_all = True
                 bad = []
-
-                # optional cap per ts
                 printed = 0
 
                 for rs, r in row_meta:
@@ -479,7 +587,9 @@ def main():
                     if rs is None:
                         row_ok = False
                         ok_all = False
-                        bad.append(f"no_raw_symbol(strike={r['strike']} side={r['call_put']} exp={r['expiration_date']})")
+                        bad.append(
+                            f"no_raw_symbol(strike={r['strike']} side={r['call_put']} exp={r['expiration_date']})"
+                        )
 
                     if rs is not None:
                         if not (
@@ -549,7 +659,12 @@ def main():
         con.close()
 
 
-        
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("\n[FATAL] Unhandled exception:")
+        print(" ", repr(e))
+        print(traceback.format_exc())
+        raise
