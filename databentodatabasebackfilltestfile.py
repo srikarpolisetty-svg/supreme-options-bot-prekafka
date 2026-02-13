@@ -27,7 +27,7 @@ import operator
 import pathlib
 import traceback
 
-from databasefunctions import get_sp500_symbols
+from databasefunctions import get_all_symbolsTester
 
 client = db.Historical(DATABENTO_API_KEY)
 
@@ -924,7 +924,7 @@ def main():
 
     ensure_table()
 
-    symbols = get_sp500_symbols()
+    symbols = get_all_symbolsTester()
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
     my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
