@@ -4,16 +4,24 @@ from datetime import datetime, timedelta, timezone
 from config import DATABENTO_API_KEY
 import duckdb
 import math
+from execution_functions import get_all_symbols
+
 
 # ==============================
 # CONFIG
 # ==============================
-SYMBOL = "AAPL"
 DB_PATH = "options_data.db"
 DAYS_BACK = 35
 
 EVERY_NTH_TIMESTAMP = 20
 MAX_CHECKS = 50
+
+# ---- VERBOSE CONTROLS ----
+PRINT_PER_TIMESTAMP_HEADER = True
+PRINT_DB_ROWS_PREVIEW = False         # print the raw DB row dicts (can be noisy)
+PRINT_EACH_CONTRACT_VALUES = True     # print a line per contract with DB + live values
+PRINT_ONLY_MISMATCHES = False         # if True, only prints per-contract lines when any mismatch occurs
+MAX_CONTRACT_LINES_PER_TS = None      # None = print all contracts; or set e.g. 12
 
 # tolerances for quotes
 BIDASK_ABS_TOL = 0.05
@@ -32,6 +40,7 @@ IV_ABS_TOL = 0.05
 IV_PCT_TOL = 0.25
 
 client = db.Historical(DATABENTO_API_KEY)
+
 
 # ==============================
 # TIME / CAST HELPERS
@@ -64,6 +73,7 @@ def _ensure_utc_col(df: pd.DataFrame, col: str) -> None:
         return
     df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
+
 # ==============================
 # NUM CHECKS
 # ==============================
@@ -91,6 +101,7 @@ def ok_int(db_v, live_v, abs_tol, pct_tol) -> bool:
         return True
     denom = max(1, (abs(db_v) + abs(live_v)) / 2.0)
     return abs(db_v - live_v) / denom <= pct_tol
+
 
 # ==============================
 # DEFINITIONS MAP
@@ -123,6 +134,7 @@ def build_def_map(symbol: str, start: datetime, end: datetime) -> dict:
     keys = list(zip(df["exp_date"].tolist(), df["strike_f"].tolist(), df["side"].tolist()))
     vals = df["raw_symbol"].tolist()
     return dict(zip(keys, vals))
+
 
 # ==============================
 # API PULLS (NO BATCH FILES)
@@ -255,6 +267,7 @@ def pull_oi_last_le_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
         out[rs] = None if (oi is None or pd.isna(oi)) else int(oi)
     return out
 
+
 # ==============================
 # IV RECOMPUTE
 # ==============================
@@ -282,199 +295,254 @@ def bs_iv_from_mid(S: float, K: float, T_years: float, r: float, mid: float, sid
             lo = m
     return 0.5 * (lo + hi)
 
+
 # ==============================
 # MAIN
 # ==============================
 def main():
-    symbol = SYMBOL.strip().upper()
-
     end_utc = db_end_utc_day()
     start_utc = end_utc - timedelta(days=DAYS_BACK)
 
-    print(f"[INFO] validate symbol={symbol} days_back={DAYS_BACK}")
+    print(f"[INFO] validate ALL symbols days_back={DAYS_BACK}")
     print(f"[INFO] time window (UTC): start={start_utc.isoformat()} end={end_utc.isoformat()}")
 
     start_db = start_utc.replace(tzinfo=None)
     end_db = end_utc.replace(tzinfo=None)
 
-    def_map = build_def_map(symbol, start_utc, end_utc)
-    if not def_map:
-        print("[FAIL] no OPRA definitions -> cannot map raw_symbol")
-        return
-    print(f"[INFO] def_map keys={len(def_map):,}")
+    symbols = get_all_symbols()
+    symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
+    print(f"[INFO] symbols_from_db={len(symbols)}")
 
     con = duckdb.connect(DB_PATH, read_only=True)
     try:
-        ts_df = con.execute(
-            """
-            WITH t AS (
-              SELECT DISTINCT timestamp
-              FROM option_snapshots_raw
-              WHERE symbol = ?
-                AND timestamp >= ?
-                AND timestamp < ?
-              ORDER BY timestamp
-            ),
-            u AS (
-              SELECT timestamp, row_number() OVER (ORDER BY timestamp) AS rn
-              FROM t
-            )
-            SELECT timestamp
-            FROM u
-            WHERE (rn - 1) % ? = 0
-            """,
-            [symbol, start_db, end_db, EVERY_NTH_TIMESTAMP],
-        ).df()
+        for symbol in symbols:
+            symbol = symbol.strip().upper()
 
-        if ts_df is None or ts_df.empty:
-            print("[FAIL] no timestamps found in DB for this symbol in this window")
-            return
+            def_map = build_def_map(symbol, start_utc, end_utc)
+            if not def_map:
+                print(f"[SKIP] {symbol}: no OPRA definitions -> cannot map raw_symbol")
+                continue
+            print(f"\n[INFO] validate symbol={symbol} days_back={DAYS_BACK}")
+            print(f"[INFO] def_map keys={len(def_map):,}")
 
-        timestamps = [to_utc_ts(x) for x in ts_df["timestamp"].tolist()]
-        if MAX_CHECKS is not None:
-            timestamps = timestamps[:MAX_CHECKS]
-        print(f"[INFO] timestamps_to_check={len(timestamps)} (every {EVERY_NTH_TIMESTAMP}th)")
-
-        pass_ct = 0
-        fail_ct = 0
-
-        for i, ts in enumerate(timestamps, start=1):
-            ts = to_utc_ts(ts)
-            ts_db = to_utc_naive_dt(ts)
-
-            rows = con.execute(
+            ts_df = con.execute(
                 """
-                SELECT
-                  timestamp,
-                  underlying_price,
-                  strike,
-                  call_put,
-                  days_to_expiry,
-                  expiration_date,
-                  bid,
-                  ask,
-                  mid,
-                  volume,
-                  open_interest,
-                  iv,
-                  spread,
-                  spread_pct
-                FROM option_snapshots_raw
-                WHERE symbol = ? AND timestamp = ?
-                ORDER BY strike, call_put
+                WITH t AS (
+                  SELECT DISTINCT timestamp
+                  FROM option_snapshots_raw
+                  WHERE symbol = ?
+                    AND timestamp >= ?
+                    AND timestamp < ?
+                  ORDER BY timestamp
+                ),
+                u AS (
+                  SELECT timestamp, row_number() OVER (ORDER BY timestamp) AS rn
+                  FROM t
+                )
+                SELECT timestamp
+                FROM u
+                WHERE (rn - 1) % ? = 0
                 """,
-                [symbol, ts_db],
+                [symbol, start_db, end_db, EVERY_NTH_TIMESTAMP],
             ).df()
 
-            if rows is None or rows.empty:
-                print(f"[{i:02d}] {ts.isoformat()} -> FAIL (no DB rows)")
-                fail_ct += 1
+            if ts_df is None or ts_df.empty:
+                print(f"[SKIP] {symbol}: no timestamps found in DB for this symbol in this window")
                 continue
 
-            row_meta = []
-            raw_symbols = []
-            for _, r in rows.iterrows():
-                exp_date = pd.Timestamp(r["expiration_date"]).date()
-                strike = float(r["strike"])
-                side = str(r["call_put"])
-                rs = def_map.get((exp_date, strike, side))
-                row_meta.append((rs, r))
-                if rs is not None:
-                    raw_symbols.append(rs)
+            timestamps = [to_utc_ts(x) for x in ts_df["timestamp"].tolist()]
+            if MAX_CHECKS is not None:
+                timestamps = timestamps[:MAX_CHECKS]
+            print(f"[INFO] timestamps_to_check={len(timestamps)} (every {EVERY_NTH_TIMESTAMP}th)")
 
-            raw_symbols = sorted(set(raw_symbols))
+            pass_ct = 0
+            fail_ct = 0
 
-            # API pulls for this timestamp
-            live_quotes = pull_cbbo_last_le_many(raw_symbols, ts)
-            live_vols = pull_trades_volume_window_many(raw_symbols, ts)
-            live_ois = pull_oi_last_le_many(raw_symbols, ts)
+            for i, ts in enumerate(timestamps, start=1):
+                ts = to_utc_ts(ts)
+                ts_db = to_utc_naive_dt(ts)
 
-            ok_all = True
-            bad = []
+                rows = con.execute(
+                    """
+                    SELECT
+                      timestamp,
+                      underlying_price,
+                      strike,
+                      call_put,
+                      days_to_expiry,
+                      expiration_date,
+                      bid,
+                      ask,
+                      mid,
+                      volume,
+                      open_interest,
+                      iv,
+                      spread,
+                      spread_pct
+                    FROM option_snapshots_raw
+                    WHERE symbol = ? AND timestamp = ?
+                    ORDER BY strike, call_put
+                    """,
+                    [symbol, ts_db],
+                ).df()
 
-            for rs, r in row_meta:
-                if rs is None:
-                    ok_all = False
-                    bad.append(f"no_raw_symbol(strike={r['strike']} side={r['call_put']} exp={r['expiration_date']})")
+                if rows is None or rows.empty:
+                    print(f"[{i:02d}] {ts.isoformat()} -> FAIL (no DB rows)")
+                    fail_ct += 1
                     continue
 
-                lbid, lask = live_quotes.get(rs, (None, None))
+                # Optional: show raw db values (first few rows) exactly as stored
+                if PRINT_PER_TIMESTAMP_HEADER:
+                    up = rows["underlying_price"].iloc[0] if "underlying_price" in rows.columns else None
+                    dte0 = rows["days_to_expiry"].iloc[0] if "days_to_expiry" in rows.columns else None
+                    exp0 = rows["expiration_date"].iloc[0] if "expiration_date" in rows.columns else None
+                    print(f"\n[{i:02d}] TS={ts.isoformat()} | db_rows={len(rows)} | underlying_price={up} | days_to_expiry={dte0} | expiration_date={exp0}")
 
-                db_bid = to_float_or_none(r["bid"]) or None
-                db_ask = to_float_or_none(r["ask"]) or None
-                db_mid = to_float_or_none(r["mid"]) or None
-                db_spr = to_float_or_none(r["spread"])
-                db_sprp = to_float_or_none(r["spread_pct"])
+                if PRINT_DB_ROWS_PREVIEW:
+                    print("[DB RAW PREVIEW] first 5 rows dicts:")
+                    for _, rr in rows.head(5).iterrows():
+                        print("   ", rr.to_dict())
 
-                if db_bid == 0: db_bid = None
-                if db_ask == 0: db_ask = None
-                if db_mid == 0: db_mid = None
+                row_meta = []
+                raw_symbols = []
+                for _, r in rows.iterrows():
+                    exp_date = pd.Timestamp(r["expiration_date"]).date()
+                    strike = float(r["strike"])
+                    side = str(r["call_put"])
+                    rs = def_map.get((exp_date, strike, side))
+                    row_meta.append((rs, r))
+                    if rs is not None:
+                        raw_symbols.append(rs)
 
-                lmid = lspr = lsprp = None
-                if lbid is not None and lask is not None and lbid > 0 and lask > 0:
-                    lmid = (lbid + lask) / 2.0
-                    lspr = lask - lbid
-                    lsprp = (lspr / lmid) if lmid else None
+                raw_symbols = sorted(set(raw_symbols))
 
-                if not (
-                    ok_num(db_bid, lbid, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
-                    ok_num(db_ask, lask, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
-                    ok_num(db_mid, lmid, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
-                    ok_num(db_spr, lspr, SPREAD_ABS_TOL, SPREAD_PCT_TOL) and
-                    ok_num(db_sprp, lsprp, SPREADPCT_ABS_TOL, 10.0)
-                ):
-                    ok_all = False
-                    bad.append(
-                        f"quote_mismatch(rs={rs} db(bid,ask,mid)=({db_bid},{db_ask},{db_mid}) "
-                        f"live(bid,ask,mid)=({lbid},{lask},{lmid}))"
-                    )
+                # API pulls for this timestamp
+                live_quotes = pull_cbbo_last_le_many(raw_symbols, ts)
+                live_vols = pull_trades_volume_window_many(raw_symbols, ts)
+                live_ois = pull_oi_last_le_many(raw_symbols, ts)
 
-                lvol = live_vols.get(rs, None)
-                db_vol = to_int_or_none(r["volume"])
-                if db_vol == 0:
-                    db_vol = None
-                if not ok_int(db_vol, lvol, VOLUME_ABS_TOL, VOLUME_PCT_TOL):
-                    ok_all = False
-                    bad.append(f"vol_mismatch(rs={rs} db={db_vol} live={lvol})")
+                ok_all = True
+                bad = []
 
-                loi = live_ois.get(rs, None)
-                db_oi = to_int_or_none(r["open_interest"])
-                if not ok_int(db_oi, loi, OI_ABS_TOL, 0.0):
-                    ok_all = False
-                    bad.append(f"oi_mismatch(rs={rs} db={db_oi} live={loi})")
+                # optional cap per ts
+                printed = 0
 
-                db_iv = to_float_or_none(r["iv"])
-                if db_iv == 0:
-                    db_iv = None
+                for rs, r in row_meta:
+                    # --- DB values (as interpreted by your current logic) ---
+                    db_bid = to_float_or_none(r["bid"]) or None
+                    db_ask = to_float_or_none(r["ask"]) or None
+                    db_mid = to_float_or_none(r["mid"]) or None
+                    db_spr = to_float_or_none(r["spread"])
+                    db_sprp = to_float_or_none(r["spread_pct"])
 
-                S = to_float_or_none(r["underlying_price"])
-                K = float(r["strike"])
-                dte = to_int_or_none(r["days_to_expiry"])
-                side = str(r["call_put"])
+                    if db_bid == 0: db_bid = None
+                    if db_ask == 0: db_ask = None
+                    if db_mid == 0: db_mid = None
 
-                liv = None
-                if S is not None and dte is not None and lmid is not None:
-                    liv = bs_iv_from_mid(S=S, K=K, T_years=dte / 365.0, r=0.01, mid=lmid, side=side)
+                    db_vol = to_int_or_none(r["volume"])
+                    if db_vol == 0:
+                        db_vol = None
 
-                if not ok_num(db_iv, liv, IV_ABS_TOL, IV_PCT_TOL):
-                    ok_all = False
-                    bad.append(f"iv_mismatch(rs={rs} db={db_iv} live={liv})")
+                    db_oi = to_int_or_none(r["open_interest"])
 
-            if ok_all:
-                print(f"[{i:02d}] {ts.isoformat()} -> PASS")
-                pass_ct += 1
-            else:
-                print(f"[{i:02d}] {ts.isoformat()} -> FAIL")
-                for msg in bad[:5]:
-                    print(f"      {msg}")
-                if len(bad) > 5:
-                    print(f"      ... +{len(bad)-5} more")
-                fail_ct += 1
+                    db_iv = to_float_or_none(r["iv"])
+                    if db_iv == 0:
+                        db_iv = None
 
-        print("\n========== DATABENTO VALIDATION SUMMARY ==========")
-        print(f"symbol={symbol}")
-        print(f"checked={len(timestamps)} pass={pass_ct} fail={fail_ct}")
-        print("===============================================\n")
+                    # --- Live values ---
+                    lbid, lask = (None, None)
+                    if rs is not None:
+                        lbid, lask = live_quotes.get(rs, (None, None))
+
+                    lmid = lspr = lsprp = None
+                    if lbid is not None and lask is not None and lbid > 0 and lask > 0:
+                        lmid = (lbid + lask) / 2.0
+                        lspr = lask - lbid
+                        lsprp = (lspr / lmid) if lmid else None
+
+                    lvol = live_vols.get(rs, None) if rs is not None else None
+                    loi = live_ois.get(rs, None) if rs is not None else None
+
+                    S = to_float_or_none(r["underlying_price"])
+                    K = float(r["strike"])
+                    dte = to_int_or_none(r["days_to_expiry"])
+                    side = str(r["call_put"])
+
+                    liv = None
+                    if S is not None and dte is not None and lmid is not None:
+                        liv = bs_iv_from_mid(S=S, K=K, T_years=dte / 365.0, r=0.01, mid=lmid, side=side)
+
+                    # --- mismatch tests (unchanged logic) ---
+                    row_ok = True
+
+                    if rs is None:
+                        row_ok = False
+                        ok_all = False
+                        bad.append(f"no_raw_symbol(strike={r['strike']} side={r['call_put']} exp={r['expiration_date']})")
+
+                    if rs is not None:
+                        if not (
+                            ok_num(db_bid, lbid, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
+                            ok_num(db_ask, lask, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
+                            ok_num(db_mid, lmid, BIDASK_ABS_TOL, BIDASK_PCT_TOL) and
+                            ok_num(db_spr, lspr, SPREAD_ABS_TOL, SPREAD_PCT_TOL) and
+                            ok_num(db_sprp, lsprp, SPREADPCT_ABS_TOL, 10.0)
+                        ):
+                            row_ok = False
+                            ok_all = False
+                            bad.append(
+                                f"quote_mismatch(rs={rs} db(bid,ask,mid)=({db_bid},{db_ask},{db_mid}) "
+                                f"live(bid,ask,mid)=({lbid},{lask},{lmid}))"
+                            )
+
+                        if not ok_int(db_vol, lvol, VOLUME_ABS_TOL, VOLUME_PCT_TOL):
+                            row_ok = False
+                            ok_all = False
+                            bad.append(f"vol_mismatch(rs={rs} db={db_vol} live={lvol})")
+
+                        if not ok_int(db_oi, loi, OI_ABS_TOL, 0.0):
+                            row_ok = False
+                            ok_all = False
+                            bad.append(f"oi_mismatch(rs={rs} db={db_oi} live={loi})")
+
+                        if not ok_num(db_iv, liv, IV_ABS_TOL, IV_PCT_TOL):
+                            row_ok = False
+                            ok_all = False
+                            bad.append(f"iv_mismatch(rs={rs} db={db_iv} live={liv})")
+
+                    # --- VERBOSE print: one line per contract with actual DB + live values ---
+                    if PRINT_EACH_CONTRACT_VALUES:
+                        if (not PRINT_ONLY_MISMATCHES) or (not row_ok):
+                            if MAX_CONTRACT_LINES_PER_TS is None or printed < MAX_CONTRACT_LINES_PER_TS:
+                                exp_date_str = str(r["expiration_date"])
+                                strike_str = f"{float(r['strike']):.4f}"
+                                cp = str(r["call_put"])
+                                print(
+                                    "  "
+                                    f"contract strike={strike_str} {cp} exp={exp_date_str} rs={rs} | "
+                                    f"DB bid/ask/mid=({db_bid},{db_ask},{db_mid}) spr/sprpct=({db_spr},{db_sprp}) "
+                                    f"vol/oi=({db_vol},{db_oi}) iv={db_iv} | "
+                                    f"LIVE bid/ask/mid=({lbid},{lask},{lmid}) spr/sprpct=({lspr},{lsprp}) "
+                                    f"vol/oi=({lvol},{loi}) iv={liv} | "
+                                    f"row_ok={row_ok}"
+                                )
+                                printed += 1
+
+                if ok_all:
+                    print(f"[{i:02d}] {ts.isoformat()} -> PASS")
+                    pass_ct += 1
+                else:
+                    print(f"[{i:02d}] {ts.isoformat()} -> FAIL")
+                    for msg in bad[:10]:
+                        print(f"      {msg}")
+                    if len(bad) > 10:
+                        print(f"      ... +{len(bad)-10} more")
+                    fail_ct += 1
+
+            print("\n========== DATABENTO VALIDATION SUMMARY ==========")
+            print(f"symbol={symbol}")
+            print(f"checked={len(timestamps)} pass={pass_ct} fail={fail_ct}")
+            print("===============================================\n")
 
     finally:
         con.close()
