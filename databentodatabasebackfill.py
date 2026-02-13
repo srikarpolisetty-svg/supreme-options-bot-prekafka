@@ -22,6 +22,9 @@ BATCH_DIR = pathlib.Path("batch_downloads")
 MAX_SYMBOLS_PER_JOB = 2000
 POLL_S = 2.0
 
+# Definitions batching (practical safe chunk)
+DEF_CHUNK_SIZE = 100
+
 
 # ---------- TIME RANGE (Databento-safe end boundary) ----------
 def db_end_utc_day() -> datetime:
@@ -68,9 +71,239 @@ def stable_shard(symbol: str, n_shards: int) -> int:
     return zlib.crc32(symbol.encode("utf-8")) % n_shards
 
 
+# ---------- SMALL UTILS ----------
+def chunk_list(xs: list, n: int):
+    for i in range(0, len(xs), n):
+        yield xs[i:i + n]
+
+
+def _ensure_utc_col(df: pd.DataFrame, col: str) -> None:
+    if df is None or df.empty or col not in df.columns:
+        return
+    df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+
+
+def get_closest_strike(target: float, strikes: list[float]) -> float:
+    if not strikes:
+        raise RuntimeError("No strikes available.")
+    return float(min(strikes, key=lambda s: abs(float(s) - float(target))))
+
+
+def is_third_friday(d):
+    return d.weekday() == 4 and (15 <= d.day <= 21)
+
+
+def has_any_weekly_expiration(expirations: list[str]) -> bool:
+    # True if any Friday expiry that is NOT the 3rd Friday (i.e., a weekly)
+    for exp in expirations:
+        d = datetime.strptime(exp, "%Y%m%d").date()
+        if d.weekday() == 4 and not is_third_friday(d):
+            return True
+    return False
+
+
+def get_friday_within_4_days(expirations: list[str], now_date):
+    for exp in sorted(expirations):
+        d = datetime.strptime(exp, "%Y%m%d").date()
+        if (
+            d.weekday() == 4 and
+            0 <= (d - now_date).days <= 4 and
+            not is_third_friday(d)
+        ):
+            return exp
+    return None
+
+
+# ---------- UNDERLYING ----------
+def fetch_last_days(symbol: str, days: int):
+    end = db_end_utc_day()
+    start = end - timedelta(days=days)
+
+    df = yf.download(symbol, start=start, end=end, interval="5m", progress=False)
+    if df is None or df.empty:
+        return df
+
+    # force UTC-aware index (UTC-only pipeline)
+    df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+
+    # market-hours filter (temporary ET), then back to UTC
+    df = df.tz_convert("US/Eastern")
+    df = df.between_time("09:30", "16:00")
+    df = df.tz_convert("UTC")
+    return df
+
+
+# ---------- DEFINITIONS MAP + NEEDED SYMBOLS (FAST) ----------
+def build_def_map(df_defs: pd.DataFrame) -> dict[tuple[float, str, datetime.date], str]:
+    """
+    Map (strike_f, side, exp_date) -> raw_symbol for fast lookup.
+    """
+    d = df_defs.copy()
+    d["strike_f"] = d["strike_price"].astype(float)
+    d["exp_date"] = pd.to_datetime(d["expiration"]).dt.date
+
+    out = {}
+    for _, r in d.iterrows():
+        k = (float(r["strike_f"]), str(r["instrument_class"]), r["exp_date"])
+        rs = r.get("raw_symbol", None)
+        if rs is not None and rs != "":
+            out[k] = str(rs)
+    return out
+
+
+def build_needed_raw_symbols_from_map(
+    data_10m: pd.DataFrame,
+    def_map: dict[tuple[float, str, datetime.date], str],
+    strikes: list[float],
+    expirations: list[str],
+) -> list[str]:
+    """
+    Pre-pass over your 10m timestamps using SAME selection logic (ATM/±1.5/±3.5 + weekly expiry within 4 days).
+    Uses def_map for fast (strike, side, exp_date) -> raw_symbol.
+    """
+    if data_10m is None or data_10m.empty:
+        return []
+
+    needed: set[str] = set()
+
+    for ts, row in data_10m.iterrows():
+        underlying_price = float(row["Close"])
+        now_date = ts.date()
+
+        exp = get_friday_within_4_days(expirations, now_date)
+        if exp is None:
+            continue
+
+        exp_date = datetime.strptime(exp, "%Y%m%d").date()
+        dte = (exp_date - now_date).days
+        if dte <= 0:
+            continue
+
+        atm = get_closest_strike(underlying_price, strikes)
+        c1 = get_closest_strike(underlying_price * 1.015, strikes)
+        p1 = get_closest_strike(underlying_price * 0.985, strikes)
+        c2 = get_closest_strike(underlying_price * 1.035, strikes)
+        p2 = get_closest_strike(underlying_price * 0.965, strikes)
+
+        strike_sides = [
+            (atm, "C"), (atm, "P"),
+            (c1, "C"), (p1, "P"),
+            (c2, "C"), (p2, "P"),
+        ]
+
+        for strike, side in strike_sides:
+            rs = def_map.get((float(strike), side, exp_date))
+            if rs:
+                needed.add(rs)
+
+    return sorted(needed)
+
+
+def get_contract_data_from_dfs_fast(
+    strike_sides, days_to_expiry, def_map, exp_date, ts, underlying_price,
+    mkt_df, trd_df, oi_df
+):
+    """
+    Same output as get_contract_data_from_dfs, but uses def_map instead of df_defs filtering.
+    """
+    symbols = {}
+    for strike, side in strike_sides:
+        symbols[(strike, side)] = def_map.get((float(strike), str(side), exp_date))
+
+    mkt_tcol = "ts_event" if "ts_event" in mkt_df.columns else ("timestamp" if "timestamp" in mkt_df.columns else None)
+    trd_tcol = "ts_event" if "ts_event" in trd_df.columns else ("timestamp" if "timestamp" in trd_df.columns else None)
+    oi_tcol  = "ts_event" if "ts_event" in oi_df.columns else ("timestamp" if "timestamp" in oi_df.columns else None)
+
+    if mkt_tcol: _ensure_utc_col(mkt_df, mkt_tcol)
+    if trd_tcol: _ensure_utc_col(trd_df, trd_tcol)
+    if oi_tcol:  _ensure_utc_col(oi_df, oi_tcol)
+
+    mkt_groups = dict(tuple(mkt_df.groupby("symbol"))) if not mkt_df.empty else {}
+    trd_groups = dict(tuple(trd_df.groupby("symbol"))) if not trd_df.empty else {}
+    oi_groups  = dict(tuple(oi_df.groupby("symbol"))) if not oi_df.empty else {}
+
+    out = {}
+
+    for strike, side in strike_sides:
+        rs = symbols.get((strike, side))
+
+        bid = ask = mid = spread = spread_pct = iv = None
+        volume = 0.0
+        open_interest = None
+
+        if rs is None:
+            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
+            continue
+
+        g_oi = oi_groups.get(rs)
+        if g_oi is not None and not g_oi.empty and oi_tcol:
+            g_oi2 = g_oi[g_oi[oi_tcol] <= ts]
+            if not g_oi2.empty:
+                open_interest = g_oi2.iloc[-1].get("open_interest", None)
+
+        g_trd = trd_groups.get(rs)
+        if g_trd is not None and not g_trd.empty and "size" in g_trd.columns and trd_tcol:
+            mask = (g_trd[trd_tcol] >= ts - pd.Timedelta(minutes=5)) & (g_trd[trd_tcol] <= ts + pd.Timedelta(minutes=5))
+            volume = float(g_trd.loc[mask, "size"].sum())
+        else:
+            volume = 0.0
+
+        g_mkt = mkt_groups.get(rs)
+        if g_mkt is None or g_mkt.empty or not mkt_tcol:
+            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
+            continue
+
+        last_row = g_mkt[g_mkt[mkt_tcol] <= ts].tail(1)
+        if last_row.empty:
+            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
+            continue
+        last = last_row.iloc[0]
+
+        bid = float(last.get("bid_px", 0) or 0)
+        ask = float(last.get("ask_px", 0) or 0)
+
+        if bid and ask:
+            mid = (bid + ask) / 2.0
+            spread = ask - bid
+            spread_pct = spread / mid if mid else None
+
+        # IV solve (bisection)
+        T = days_to_expiry / 365.0
+        if mid and T > 0:
+            S = float(underlying_price)
+            K = float(strike)
+            r = 0.01
+            lo, hi = 1e-6, 5.0
+
+            def N(x):
+                return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+            def bs_price(sigma):
+                d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+                d2 = d1 - sigma * math.sqrt(T)
+                if side == "C":
+                    return S * N(d1) - K * math.exp(-r * T) * N(d2)
+                else:
+                    return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
+
+            for _ in range(60):
+                mid_sigma = 0.5 * (lo + hi)
+                if bs_price(mid_sigma) > mid:
+                    hi = mid_sigma
+                else:
+                    lo = mid_sigma
+
+            iv = 0.5 * (lo + hi)
+
+        out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
+
+    return out
+
+
 # ---------- BATCH DOWNLOAD ----------
 def _to_iso(x) -> str:
     return pd.Timestamp(x).to_pydatetime().isoformat()
+
 
 def batch_get_df(
     dataset: str,
@@ -118,9 +351,6 @@ def batch_get_df(
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-def chunk_symbols(symbols: list[str], chunk_size: int = MAX_SYMBOLS_PER_JOB):
-    for i in range(0, len(symbols), chunk_size):
-        yield symbols[i:i + chunk_size]
 
 def batch_get_df_chunked(
     dataset: str,
@@ -157,7 +387,7 @@ def batch_get_df_chunked(
     print(f"[BATCH] symbol list too large ({len(symbols)}). Splitting into {n_chunks} chunk(s) of {MAX_SYMBOLS_PER_JOB}...")
 
     parts = []
-    for idx, sym_chunk in enumerate(chunk_symbols(symbols, MAX_SYMBOLS_PER_JOB), start=1):
+    for idx, sym_chunk in enumerate(chunk_list(symbols, MAX_SYMBOLS_PER_JOB), start=1):
         print(f"[BATCH] chunk {idx}/{n_chunks}: symbols={len(sym_chunk)}")
         df_part = batch_get_df(
             dataset=dataset,
@@ -200,282 +430,207 @@ def append_row(
         "time_decay_bucket": time_decay_bucket,
     })
 
-def _ensure_utc_col(df: pd.DataFrame, col: str) -> None:
-    if df is None or df.empty or col not in df.columns:
-        return
-    # Always parse/convert -> UTC-aware
-    df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
-def get_closest_strike(target: float, strikes: list[float]) -> float:
-    if not strikes:
-        raise RuntimeError("No strikes available.")
-    return float(min(strikes, key=lambda s: abs(float(s) - float(target))))
-
-def is_third_friday(d):
-    return d.weekday() == 4 and (15 <= d.day <= 21)
-
-def has_any_weekly_expiration(expirations: list[str]) -> bool:
-    for exp in expirations:
-        d = datetime.strptime(exp, "%Y%m%d").date()
-        if d.weekday() == 4 and not is_third_friday(d):
-            return True
-    return False
-
-def get_friday_within_4_days(expirations: list[str], now_date):
-    for exp in sorted(expirations):
-        d = datetime.strptime(exp, "%Y%m%d").date()
-        if (
-            d.weekday() == 4 and
-            0 <= (d - now_date).days <= 4 and
-            not is_third_friday(d)
-        ):
-            return exp
-    return None
-
-
-# ---------- ✅ NEW: Build only the raw_symbols you actually need ----------
-def build_needed_raw_symbols(
-    data_10m: pd.DataFrame,
-    df_defs: pd.DataFrame,
-    strikes: list[float],
-    expirations: list[str],
-) -> list[str]:
+# ---------- DEFINITIONS BATCHING HELPERS ----------
+def detect_parent_col(df_defs: pd.DataFrame) -> str:
     """
-    Pre-pass over your 10m timestamps using the SAME selection logic (ATM/±1.5/±3.5 + weekly expiry within 4 days).
-    Map (strike, side, exp_date) -> raw_symbol via definitions.
-    Returns a deduped sorted list of raw_symbols actually needed.
+    We requested stype_in='parent'. The returned definition df usually carries the parent/root in a column.
+    Try common candidates; fall back to 'symbol' if it looks like 'AAPL.OPT'.
     """
-    if data_10m is None or data_10m.empty:
-        return []
+    cols = set(df_defs.columns)
 
-    d = df_defs.copy()
-    d["strike_f"] = d["strike_price"].astype(float)
-    d["exp_date"] = pd.to_datetime(d["expiration"]).dt.date
+    for c in ["parent", "underlying", "root", "sym_root", "ticker"]:
+        if c in cols:
+            return c
 
-    needed: set[str] = set()
+    if "symbol" in cols:
+        # If values look like "AAPL.OPT" (because stype_in='parent'), use that.
+        sample = df_defs["symbol"].dropna().astype(str).head(20).tolist()
+        if any(s.endswith(".OPT") for s in sample):
+            return "symbol"
 
-    for ts, row in data_10m.iterrows():
-        underlying_price = float(row["Close"])
-        now_date = ts.date()
-
-        exp = get_friday_within_4_days(expirations, now_date)
-        if exp is None:
-            continue
-
-        exp_date = datetime.strptime(exp, "%Y%m%d").date()
-        dte = (exp_date - now_date).days
-        if dte <= 0:
-            continue
-
-        atm = get_closest_strike(underlying_price, strikes)
-        c1 = get_closest_strike(underlying_price * 1.015, strikes)
-        p1 = get_closest_strike(underlying_price * 0.985, strikes)
-        c2 = get_closest_strike(underlying_price * 1.035, strikes)
-        p2 = get_closest_strike(underlying_price * 0.965, strikes)
-
-        strike_sides = [
-            (atm, "C"), (atm, "P"),
-            (c1, "C"), (p1, "P"),
-            (c2, "C"), (p2, "P"),
-        ]
-
-        for strike, side in strike_sides:
-            m = (
-                (d["strike_f"] == float(strike)) &
-                (d["instrument_class"] == side) &
-                (d["exp_date"] == exp_date)
-            )
-            hit = d.loc[m, "raw_symbol"].head(1)
-            if not hit.empty:
-                needed.add(str(hit.iloc[0]))
-
-    return sorted(needed)
+    raise RuntimeError(f"Cannot find parent column in definition df. cols={list(df_defs.columns)}")
 
 
-# ---------- CORE QUOTE/TRADE/OI RESOLUTION ----------
-def get_contract_data_from_dfs(
-    strike_sides, days_to_expiry, df_defs, exp_date, ts, underlying_price,
-    mkt_df, trd_df, oi_df
-):
-    symbols = {}
-    for strike, side in strike_sides:
-        contract_row = df_defs[
-            (df_defs["strike_price"].astype(float) == float(strike)) &
-            (df_defs["instrument_class"] == side) &
-            (pd.to_datetime(df_defs["expiration"]).dt.date == exp_date)
-        ].head(1)
-
-        symbols[(strike, side)] = None if contract_row.empty else contract_row.iloc[0]["raw_symbol"]
-
-    mkt_tcol = "ts_event" if "ts_event" in mkt_df.columns else ("timestamp" if "timestamp" in mkt_df.columns else None)
-    trd_tcol = "ts_event" if "ts_event" in trd_df.columns else ("timestamp" if "timestamp" in trd_df.columns else None)
-    oi_tcol  = "ts_event" if "ts_event" in oi_df.columns else ("timestamp" if "timestamp" in oi_df.columns else None)
-
-    if mkt_tcol: _ensure_utc_col(mkt_df, mkt_tcol)
-    if trd_tcol: _ensure_utc_col(trd_df, trd_tcol)
-    if oi_tcol:  _ensure_utc_col(oi_df, oi_tcol)
-
-    mkt_groups = dict(tuple(mkt_df.groupby("symbol"))) if not mkt_df.empty else {}
-    trd_groups = dict(tuple(trd_df.groupby("symbol"))) if not trd_df.empty else {}
-    oi_groups = dict(tuple(oi_df.groupby("symbol"))) if not oi_df.empty else {}
-    dict(tuple(oi_df.groupby("symbol"))) if not oi_df.empty else {}
-
-    out = {}
-
-    for strike, side in strike_sides:
-        rs = symbols.get((strike, side))
-
-        bid = ask = mid = spread = spread_pct = iv = None
-        volume = 0.0
-        open_interest = None
-
-        if rs is None:
-            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
-            continue
-
-        g_oi = oi_groups.get(rs)
-        if g_oi is not None and not g_oi.empty and oi_tcol:
-            g_oi2 = g_oi[g_oi[oi_tcol] <= ts]
-            if not g_oi2.empty:
-                open_interest = g_oi2.iloc[-1].get("open_interest", None)
-
-        g_trd = trd_groups.get(rs)
-        if g_trd is not None and not g_trd.empty and "size" in g_trd.columns and trd_tcol:
-            mask = (g_trd[trd_tcol] >= ts - pd.Timedelta(minutes=5)) & (g_trd[trd_tcol] <= ts + pd.Timedelta(minutes=5))
-            volume = float(g_trd.loc[mask, "size"].sum())
-        else:
-            volume = 0.0
-
-        g_mkt = mkt_groups.get(rs)
-        if g_mkt is None or g_mkt.empty or not mkt_tcol:
-            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
-            continue
-
-        last_row = g_mkt[g_mkt[mkt_tcol] <= ts].tail(1)
-        if last_row.empty:
-            out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
-            continue
-        last = last_row.iloc[0]
-
-        bid = float(last.get("bid_px", 0) or 0)
-        ask = float(last.get("ask_px", 0) or 0)
-
-        if bid and ask:
-            mid = (bid + ask) / 2.0
-            spread = ask - bid
-            spread_pct = spread / mid if mid else None
-
-        T = days_to_expiry / 365.0
-        if mid and T > 0:
-            S = float(underlying_price)
-            K = float(strike)
-            r = 0.01
-            lo, hi = 1e-6, 5.0
-
-            def N(x):
-                return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-            def bs_price(sigma):
-                d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-                d2 = d1 - sigma * math.sqrt(T)
-                if side == "C":
-                    return S * N(d1) - K * math.exp(-r * T) * N(d2)
-                else:
-                    return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
-
-            for _ in range(60):
-                mid_sigma = 0.5 * (lo + hi)
-                if bs_price(mid_sigma) > mid:
-                    hi = mid_sigma
-                else:
-                    lo = mid_sigma
-
-            iv = 0.5 * (lo + hi)
-
-        out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
-
-    return out
+def parent_to_underlying(parent_val: str) -> str:
+    s = str(parent_val)
+    # parent often "AAPL.OPT"
+    if s.endswith(".OPT"):
+        return s[:-4]
+    # sometimes might be just "AAPL"
+    return s
 
 
-# ---------- UNDERLYING ----------
-def fetch_last_days(symbol: str, days: int):
-    end = db_end_utc_day()
-    start = end - timedelta(days=days)
-
-    df = yf.download(symbol, start=start, end=end, interval="5m", progress=False)
-    if df is None or df.empty:
-        return df
-
-    # force UTC-aware index (UTC-only pipeline)
-    df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-
-    # market-hours filter (temporary ET), then back to UTC
-    df = df.tz_convert("US/Eastern")
-    df = df.between_time("09:30", "16:00")
-    df = df.tz_convert("UTC")
-    return df
-
-
-# ---------- ONE SYMBOL ----------
-def run_symbol(symbol: str, days_back: int = 35):
-    data = fetch_last_days(symbol, days_back)
-    if data is None or data.empty:
-        print(f"⏭️ {symbol}: no underlying data")
-        return
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    # ensure UTC-aware
-    data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
-    data_10m = data.resample("10min").last().dropna()
-    if data_10m.empty:
-        print(f"⏭️ {symbol}: no 10m bars")
-        return
-
+# ---------- ✅ SHARD TWO-PHASE (defs batched; data batched) ----------
+def run_shard_two_phase(symbols: list[str], days_back: int = 35):
     end = db_end_utc_day()
     start = end - timedelta(days=days_back)
 
-    # Definitions
-    defs = client.timeseries.get_range(
-        dataset="OPRA.PILLAR",
-        schema="definition",
-        stype_in="parent",
-        symbols=[f"{symbol}.OPT"],
-        start=start,
-        end=end - timedelta(hours=24),
-    )
-    df_defs = defs.to_df()
-    if df_defs is None or df_defs.empty:
-        print(f"⏭️ {symbol}: no options definitions")
+    # ---------- PHASE 1A: underlying per symbol (still per-symbol; unavoidable) ----------
+    under_10m: dict[str, pd.DataFrame] = {}
+
+    for symbol in symbols:
+        data = fetch_last_days(symbol, days_back)
+        if data is None or data.empty:
+            print(f"⏭️ {symbol}: no underlying data")
+            continue
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
+        data_10m = data.resample("10min").last().dropna()
+        if data_10m.empty:
+            print(f"⏭️ {symbol}: no 10m bars")
+            continue
+
+        under_10m[symbol] = data_10m
+
+    if not under_10m:
+        print("[INFO] no symbols with valid underlying data")
         return
 
-    strikes = df_defs["strike_price"].dropna().astype(float).unique().tolist()
-    strikes.sort()
+    eligible_syms = sorted(under_10m.keys())
+    print(f"[INFO] underlying ok: {len(eligible_syms)} symbol(s). batching definitions...")
 
-    expirations = pd.to_datetime(df_defs["expiration"]).dt.strftime("%Y%m%d").dropna().unique().tolist()
-    if not has_any_weekly_expiration(expirations):
-        print(f"⏭️ {symbol}: only monthly expirations -> skip")
+    # ---------- PHASE 1B: definitions in chunks; build plans + union raw_symbols ----------
+    plans: dict[str, dict] = {}
+    union_raw: set[str] = set()
+
+    for sym_chunk in chunk_list(eligible_syms, DEF_CHUNK_SIZE):
+        parents = [f"{s}.OPT" for s in sym_chunk]
+
+        try:
+            defs = client.timeseries.get_range(
+                dataset="OPRA.PILLAR",
+                schema="definition",
+                stype_in="parent",
+                symbols=parents,
+                start=start,
+                end=end - timedelta(hours=24),
+            )
+            df_defs_all = defs.to_df()
+        except Exception as e:
+            print(f"❌ defs chunk error (size={len(sym_chunk)}): {e}")
+            # degrade strategy: retry smaller chunks
+            if len(sym_chunk) > 1:
+                half = max(1, len(sym_chunk) // 2)
+                print(f"[DEGRADE] retrying in chunks of {half}")
+                for sub in chunk_list(sym_chunk, half):
+                    # recurse by calling run_shard_two_phase is overkill; just do inline:
+                    parents2 = [f"{s}.OPT" for s in sub]
+                    try:
+                        defs2 = client.timeseries.get_range(
+                            dataset="OPRA.PILLAR",
+                            schema="definition",
+                            stype_in="parent",
+                            symbols=parents2,
+                            start=start,
+                            end=end - timedelta(hours=24),
+                        )
+                        df2 = defs2.to_df()
+                        if df2 is None or df2.empty:
+                            continue
+                        parent_col = detect_parent_col(df2)
+                        for parent_val, g in df2.groupby(parent_col):
+                            sym = parent_to_underlying(parent_val)
+                            if sym not in under_10m:
+                                continue
+                            df_defs = g.copy()
+                            if df_defs.empty:
+                                continue
+
+                            strikes = df_defs["strike_price"].dropna().astype(float).unique().tolist()
+                            strikes.sort()
+
+                            expirations = pd.to_datetime(df_defs["expiration"]).dt.strftime("%Y%m%d").dropna().unique().tolist()
+                            if not has_any_weekly_expiration(expirations):
+                                print(f"⏭️ {sym}: only monthly expirations -> skip")
+                                continue
+
+                            def_map = build_def_map(df_defs)
+
+                            raw_needed = build_needed_raw_symbols_from_map(
+                                data_10m=under_10m[sym],
+                                def_map=def_map,
+                                strikes=strikes,
+                                expirations=expirations,
+                            )
+                            if not raw_needed:
+                                print(f"⏭️ {sym}: no needed raw_symbols produced")
+                                continue
+
+                            plans[sym] = {
+                                "data_10m": under_10m[sym],
+                                "strikes": strikes,
+                                "expirations": expirations,
+                                "def_map": def_map,
+                                "raw_needed": set(raw_needed),
+                            }
+                            union_raw.update(raw_needed)
+                            print(f"[PLAN] {sym}: raw_needed={len(raw_needed):,}")
+                    except Exception as e2:
+                        print(f"❌ defs subchunk error (size={len(sub)}): {e2}")
+            continue
+
+        if df_defs_all is None or df_defs_all.empty:
+            continue
+
+        parent_col = detect_parent_col(df_defs_all)
+
+        for parent_val, g in df_defs_all.groupby(parent_col):
+            sym = parent_to_underlying(parent_val)
+
+            if sym not in under_10m:
+                continue
+
+            df_defs = g.copy()
+            if df_defs.empty:
+                print(f"⏭️ {sym}: no options definitions")
+                continue
+
+            strikes = df_defs["strike_price"].dropna().astype(float).unique().tolist()
+            strikes.sort()
+
+            expirations = pd.to_datetime(df_defs["expiration"]).dt.strftime("%Y%m%d").dropna().unique().tolist()
+            if not has_any_weekly_expiration(expirations):
+                print(f"⏭️ {sym}: only monthly expirations -> skip")
+                continue
+
+            def_map = build_def_map(df_defs)
+
+            raw_needed = build_needed_raw_symbols_from_map(
+                data_10m=under_10m[sym],
+                def_map=def_map,
+                strikes=strikes,
+                expirations=expirations,
+            )
+            if not raw_needed:
+                print(f"⏭️ {sym}: no needed raw_symbols produced")
+                continue
+
+            plans[sym] = {
+                "data_10m": under_10m[sym],
+                "strikes": strikes,
+                "expirations": expirations,
+                "def_map": def_map,
+                "raw_needed": set(raw_needed),
+            }
+            union_raw.update(raw_needed)
+            print(f"[PLAN] {sym}: raw_needed={len(raw_needed):,}")
+
+    if not plans or not union_raw:
+        print("[INFO] nothing to do (no plans / no raw symbols).")
         return
 
-    # ✅ IMPORTANT: only download raw_symbols we will actually use
-    raw_symbols_needed = build_needed_raw_symbols(
-        data_10m=data_10m,
-        df_defs=df_defs,
-        strikes=strikes,
-        expirations=expirations,
-    )
-    if not raw_symbols_needed:
-        print(f"⏭️ {symbol}: no needed raw_symbols produced")
-        return
+    union_raw_list = sorted(union_raw)
+    print(f"[INFO] shard union raw_symbols={len(union_raw_list):,} -> ONE batch per schema")
 
-    print(f"[INFO] {symbol}: batch downloading {days_back}d | raw_symbols_needed={len(raw_symbols_needed):,}")
-
-    # ✅ chunked batch downloads
+    # ---------- PHASE 2: ONE batch per schema ----------
     mkt_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
         schema="cbbo-1m",
-        symbols=raw_symbols_needed,
+        symbols=union_raw_list,
         start=start,
         end=end,
         stype_in="raw_symbol",
@@ -486,7 +641,7 @@ def run_symbol(symbol: str, days_back: int = 35):
     trd_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
         schema="trades",
-        symbols=raw_symbols_needed,
+        symbols=union_raw_list,
         start=start,
         end=end,
         stype_in="raw_symbol",
@@ -497,7 +652,7 @@ def run_symbol(symbol: str, days_back: int = 35):
     oi_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
         schema="statistics",
-        symbols=raw_symbols_needed,
+        symbols=union_raw_list,
         start=start - pd.Timedelta(days=1),
         end=end,
         stype_in="raw_symbol",
@@ -505,7 +660,7 @@ def run_symbol(symbol: str, days_back: int = 35):
         poll_s=POLL_S,
     )
 
-    # timestamp columns
+    # normalize timestamp cols once
     mkt_tcol = "ts_event" if "ts_event" in mkt_df_all.columns else ("timestamp" if "timestamp" in mkt_df_all.columns else None)
     trd_tcol = "ts_event" if "ts_event" in trd_df_all.columns else ("timestamp" if "timestamp" in trd_df_all.columns else None)
     oi_tcol  = "ts_event" if "ts_event" in oi_df_all.columns else ("timestamp" if "timestamp" in oi_df_all.columns else None)
@@ -514,132 +669,144 @@ def run_symbol(symbol: str, days_back: int = 35):
     if trd_tcol: _ensure_utc_col(trd_df_all, trd_tcol)
     if oi_tcol:  _ensure_utc_col(oi_df_all, oi_tcol)
 
-    results = []
+    # ---------- PHASE 3: per symbol compute using global dfs ----------
+    for symbol, plan in plans.items():
+        data_10m = plan["data_10m"]
+        strikes = plan["strikes"]
+        expirations = plan["expirations"]
+        def_map = plan["def_map"]
+        raw_needed = plan["raw_needed"]
 
-    for window_start, window_df in data_10m.groupby(pd.Grouper(freq="1h")):
-        if window_df.empty:
-            continue
-        window_end = window_start + pd.Timedelta(hours=1)
+        results = []
 
-        per_ts = {}
-        for ts, row in window_df.iterrows():
-            underlying_price = float(row["Close"])
+        for window_start, window_df in data_10m.groupby(pd.Grouper(freq="1h")):
+            if window_df.empty:
+                continue
+            window_end = window_start + pd.Timedelta(hours=1)
 
-            atm_strike = get_closest_strike(underlying_price, strikes)
-            c1 = get_closest_strike(underlying_price * 1.015, strikes)
-            p1 = get_closest_strike(underlying_price * 0.985, strikes)
-            c2 = get_closest_strike(underlying_price * 1.035, strikes)
-            p2 = get_closest_strike(underlying_price * 0.965, strikes)
+            per_ts = {}
+            for ts, row in window_df.iterrows():
+                underlying_price = float(row["Close"])
 
-            now_date = ts.date()
-            exp = get_friday_within_4_days(expirations, now_date)
-            if exp is None:
+                atm_strike = get_closest_strike(underlying_price, strikes)
+                c1 = get_closest_strike(underlying_price * 1.015, strikes)
+                p1 = get_closest_strike(underlying_price * 0.985, strikes)
+                c2 = get_closest_strike(underlying_price * 1.035, strikes)
+                p2 = get_closest_strike(underlying_price * 0.965, strikes)
+
+                now_date = ts.date()
+                exp = get_friday_within_4_days(expirations, now_date)
+                if exp is None:
+                    continue
+
+                exp_date = datetime.strptime(exp, "%Y%m%d").date()
+                days_till_expiry = (exp_date - now_date).days
+                if days_till_expiry <= 0:
+                    continue
+
+                strike_sides = [
+                    (atm_strike, "C"), (atm_strike, "P"),
+                    (c1, "C"), (p1, "P"),
+                    (c2, "C"), (p2, "P"),
+                ]
+
+                per_ts[ts] = (underlying_price, days_till_expiry, exp_date, strike_sides)
+
+            if not per_ts:
                 continue
 
-            exp_date = datetime.strptime(exp, "%Y%m%d").date()
-            days_till_expiry = (exp_date - now_date).days
-            if days_till_expiry <= 0:
-                continue
-
-            strike_sides = [
-                (atm_strike, "C"), (atm_strike, "P"),
-                (c1, "C"), (p1, "P"),
-                (c2, "C"), (p2, "P"),
-            ]
-
-            per_ts[ts] = (underlying_price, days_till_expiry, exp_date, strike_sides)
-
-        if not per_ts:
-            continue
-
-        # filter big dfs down to this hour
-        if mkt_tcol:
-            mkt_df_win = mkt_df_all[(mkt_df_all[mkt_tcol] >= window_start) & (mkt_df_all[mkt_tcol] < window_end)]
-        else:
-            mkt_df_win = pd.DataFrame()
-
-        if trd_tcol:
-            trd_df_win = trd_df_all[(trd_df_all[trd_tcol] >= window_start) & (trd_df_all[trd_tcol] < window_end)]
-        else:
-            trd_df_win = pd.DataFrame()
-
-        if oi_tcol:
-            oi_start = window_start - pd.Timedelta(days=1)
-            # ✅ IMPORTANT: filter using the ACTUAL oi_tcol (not oi_df_all.columns[0])
-            oi_df_win = oi_df_all[(oi_df_all[oi_tcol] >= oi_start) & (oi_df_all[oi_tcol] < window_end)]
-        else:
-            oi_df_win = pd.DataFrame()
-
-        # ✅ NEW: avoid SettingWithCopyWarning when _ensure_utc_col mutates
-        mkt_df_win = mkt_df_win.copy()
-        trd_df_win = trd_df_win.copy()
-        oi_df_win  = oi_df_win.copy()
-
-        for ts, (underlying_price, days_till_expiry, exp_date, strike_sides) in per_ts.items():
-            if days_till_expiry <= 1:
-                time_decay_bucket = "EXTREME"
-            elif days_till_expiry <= 3:
-                time_decay_bucket = "HIGH"
-            elif days_till_expiry <= 7:
-                time_decay_bucket = "MEDIUM"
+            # filter GLOBAL dfs down to this symbol's raw_needed AND this hour
+            if mkt_tcol and not mkt_df_all.empty:
+                mkt_df_win = mkt_df_all[
+                    (mkt_df_all[mkt_tcol] >= window_start) &
+                    (mkt_df_all[mkt_tcol] < window_end) &
+                    (mkt_df_all["symbol"].isin(raw_needed))
+                ].copy()
             else:
-                time_decay_bucket = "LOW"
+                mkt_df_win = pd.DataFrame()
 
-            # ✅ UTC-only snapshot_id with explicit Z
-            ts_utc = pd.Timestamp(ts).tz_convert("UTC")
-            snapshot_id = f"{symbol}_{ts_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            if trd_tcol and not trd_df_all.empty:
+                trd_df_win = trd_df_all[
+                    (trd_df_all[trd_tcol] >= window_start) &
+                    (trd_df_all[trd_tcol] < window_end) &
+                    (trd_df_all["symbol"].isin(raw_needed))
+                ].copy()
+            else:
+                trd_df_win = pd.DataFrame()
 
-            out = get_contract_data_from_dfs(
-                strike_sides,
-                days_till_expiry,
-                df_defs,
-                exp_date,
-                ts,
-                underlying_price,
-                mkt_df_win,
-                trd_df_win,
-                oi_df_win,
-            )
+            if oi_tcol and not oi_df_all.empty:
+                oi_start = window_start - pd.Timedelta(days=1)
+                oi_df_win = oi_df_all[
+                    (oi_df_all[oi_tcol] >= oi_start) &
+                    (oi_df_all[oi_tcol] < window_end) &
+                    (oi_df_all["symbol"].isin(raw_needed))
+                ].copy()
+            else:
+                oi_df_win = pd.DataFrame()
 
-            for (strike, side) in strike_sides:
-                bid, ask, mid, oi, vol, iv, spread, spread_pct = out.get(
-                    (strike, side), (None, None, None, None, 0.0, None, None, None)
-                )
-
-                if strike == strike_sides[0][0]:
-                    bucket = "ATM"
-                elif strike in (strike_sides[2][0], strike_sides[3][0]):
-                    bucket = "OTM_1"
+            for ts, (underlying_price, days_till_expiry, exp_date, strike_sides) in per_ts.items():
+                if days_till_expiry <= 1:
+                    time_decay_bucket = "EXTREME"
+                elif days_till_expiry <= 3:
+                    time_decay_bucket = "HIGH"
+                elif days_till_expiry <= 7:
+                    time_decay_bucket = "MEDIUM"
                 else:
-                    bucket = "OTM_2"
+                    time_decay_bucket = "LOW"
 
-                append_row(
-                    results,
-                    snapshot_id, ts, symbol, underlying_price,
-                    days_till_expiry, exp_date, time_decay_bucket,
-                    strike, bucket, side,
-                    bid, ask, mid, vol, oi, iv, spread, spread_pct
+                ts_utc = pd.Timestamp(ts).tz_convert("UTC")
+                snapshot_id = f"{symbol}_{ts_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+
+                out = get_contract_data_from_dfs_fast(
+                    strike_sides,
+                    days_till_expiry,
+                    def_map,
+                    exp_date,
+                    ts,
+                    underlying_price,
+                    mkt_df_win,
+                    trd_df_win,
+                    oi_df_win,
                 )
 
-    if not results:
-        print(f"⏭️ {symbol}: no rows produced")
-        return
+                for (strike, side) in strike_sides:
+                    bid, ask, mid, oi, vol, iv, spread, spread_pct = out.get(
+                        (strike, side), (None, None, None, None, 0.0, None, None, None)
+                    )
 
-    df = pd.DataFrame(results)
+                    if strike == strike_sides[0][0]:
+                        bucket = "ATM"
+                    elif strike in (strike_sides[2][0], strike_sides[3][0]):
+                        bucket = "OTM_1"
+                    else:
+                        bucket = "OTM_2"
 
-    # ✅ FORCE UTC-only storage: DuckDB TIMESTAMP is tz-naive; store UTC-naive
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+                    append_row(
+                        results,
+                        snapshot_id, ts, symbol, underlying_price,
+                        days_till_expiry, exp_date, time_decay_bucket,
+                        strike, bucket, side,
+                        bid, ask, mid, vol, oi, iv, spread, spread_pct
+                    )
 
-    con = duckdb.connect(DB_PATH)
-    try:
-        con.register("df_view", df)
-        cols = ",".join(df.columns)
-        con.execute(f"INSERT INTO option_snapshots_raw({cols}) SELECT {cols} FROM df_view")
-        con.unregister("df_view")
-    finally:
-        con.close()
+        if not results:
+            print(f"⏭️ {symbol}: no rows produced")
+            continue
 
-    print(f"✅ {symbol}: inserted {len(df):,} rows")
+        df = pd.DataFrame(results)
+        # DuckDB TIMESTAMP is tz-naive; store UTC-naive
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+
+        con = duckdb.connect(DB_PATH)
+        try:
+            con.register("df_view", df)
+            cols = ",".join(df.columns)
+            con.execute(f"INSERT INTO option_snapshots_raw({cols}) SELECT {cols} FROM df_view")
+            con.unregister("df_view")
+        finally:
+            con.close()
+
+        print(f"✅ {symbol}: inserted {len(df):,} rows")
 
 
 # ---------- MAIN ----------
@@ -658,11 +825,8 @@ def main():
 
     print(f"[INFO] shard={args.shard_id}/{args.n_shards} symbols={len(my_symbols)} days_back={args.days_back}")
 
-    for sym in my_symbols:
-        try:
-            run_symbol(sym, days_back=args.days_back)
-        except Exception as e:
-            print(f"❌ {sym}: error -> {e}")
+    # ✅ now uses shard-level two-phase: defs batched, data batched
+    run_shard_two_phase(my_symbols, days_back=args.days_back)
 
 
 if __name__ == "__main__":

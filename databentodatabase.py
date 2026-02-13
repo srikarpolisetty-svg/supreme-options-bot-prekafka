@@ -5,902 +5,450 @@ import datetime
 import pytz
 import pandas as pd
 import databento as db
+import duckdb
 
-from databasefunctions import compute_z_scores_for_bucket
-from databasefunctions import stabilize_schema
+from databasefunctions import compute_z_scores_for_bucket, stabilize_schema
 from config import DATABENTO_API_KEY
 
+DUCKDB_PATH = "live_state.duckdb"
+STRIKES_MAX_AGE_MIN = 10
+
+# -------------------------
+# DB READ HELPERS
+# -------------------------
+def get_sixpack_from_db(con, symbol: str) -> pd.DataFrame:
+    """
+    Returns 6 rows for a symbol from live_strikes6_latest.
+    Expected labels: ATM, C1, P1, C2, P2 with instrument_class C/P as appropriate.
+    """
+    return con.execute(
+        """
+        SELECT
+            parent_symbol AS symbol,
+            exp_yyyymmdd,
+            expiration_date,
+            label,
+            instrument_class,
+            strike_price,
+            raw_symbol,
+            underlying_price,
+            ts_refresh
+        FROM live_strikes6_latest
+        WHERE parent_symbol = ?
+        ORDER BY label, instrument_class
+        """,
+        [symbol],
+    ).fetchdf()
 
 
-def run_databento_option_snapshot(run_id: str, symbol: str, shard_id: int):
-    client = db.Historical(DATABENTO_API_KEY)  # uses DATABENTO_API_KEY env var
-
-    now = dt.datetime.now(tz=pytz.UTC)
-
-    buffer_minutes = 10  # safe lag behind real time
-
-    safe_end = now - dt.timedelta(minutes=buffer_minutes)
-    safe_start = safe_end - dt.timedelta(minutes=2)  # your 2-minute slice
-
-    data = client.timeseries.get_range(
-        dataset="EQUS.MINI",
-        schema="ohlcv-1m",
-        symbols=[symbol],
-        start=safe_start.isoformat(),
-        end=safe_end.isoformat(),
-    )
 
 
-    df = data.to_df()
-    underlying_price = float(df["close"].iloc[-1])
 
-    chain_df = client.timeseries.get_range(
-        dataset="OPRA.PILLAR",
-        schema="definition",
-        symbols=f"{symbol}.OPT",  # all {symbol} options under the parent
-        stype_in="parent",        # parent symbology
-        start=dt.date.today(),    # "as-of" day; can be a date
-    ).to_df()
 
-    # Useful columns typically include: raw_symbol, expiration, strike_price, instrument_class (C/P)
-    chain_df["exp_yyyymmdd"] = chain_df["expiration"].dt.strftime("%Y%m%d")
-    expirations = sorted(chain_df["exp_yyyymmdd"].unique())
-    strikes = sorted(chain_df["strike_price"].astype(float).unique())
+def get_quote_from_db(con, raw_symbol: str) -> dict:
+    row = con.execute(
+        """
+        SELECT bid, ask, mid, spread, spread_pct
+        FROM live_quotes_latest
+        WHERE raw_symbol = ?
+        """,
+        [raw_symbol],
+    ).fetchone()
 
-    def get_friday_within_4_days(expirations: list[str]) -> str | None:
-        if not expirations:
-            return None
+    if not row:
+        return {"bid": None, "ask": None, "mid": None, "spread": None, "spread_pct": None}
 
-        today = datetime.date.today()
+    bid, ask, mid, spread, spread_pct = row
+    # compute derived if missing
+    if mid is None and bid is not None and ask is not None and bid > 0 and ask > 0:
+        mid = 0.5 * (float(bid) + float(ask))
+    if spread is None and bid is not None and ask is not None and bid > 0 and ask > 0:
+        spread = float(ask) - float(bid)
+    if spread_pct is None and mid is not None and mid > 0 and spread is not None:
+        spread_pct = float(spread) / float(mid)
 
-        for exp in sorted(expirations):
-            d = datetime.datetime.strptime(exp, "%Y%m%d").date()
+    return {"bid": bid, "ask": ask, "mid": mid, "spread": spread, "spread_pct": spread_pct}
 
-            if (
-                d.weekday() == 4                      # Friday
-                and 0 <= (d - today).days <= 4        # within 4 days
-                and not (15 <= d.day <= 21)           # not 3rd Friday
-            ):
-                return exp
 
+def get_vol10m_from_db(con, raw_symbol: str) -> int:
+    row = con.execute(
+        """
+        SELECT vol10m
+        FROM live_vol10m_latest
+        WHERE raw_symbol = ?
+        """,
+        [raw_symbol],
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def get_oi_from_db(con, raw_symbol: str) -> int | None:
+    """
+    Daily OI populated by streamer into live_oi_latest.
+    """
+    row = con.execute(
+        """
+        SELECT open_interest
+        FROM live_oi_latest
+        WHERE raw_symbol = ?
+        """,
+        [raw_symbol],
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
         return None
 
-    exp = get_friday_within_4_days(expirations)
 
-    if exp is None:
-        return "no expiration this friday"
+# -------------------------
+# MARKET MATH
+# -------------------------
+def bs_iv_bisect(mid: float | None, S: float, K: float, days_to_expiry: int, call_put: str) -> float | None:
+    if mid is None or mid <= 0:
+        return None
+    T = float(days_to_expiry) / 365.0
+    if T <= 0:
+        return None
 
-    atm = underlying_price
-    otm_call_1_target = atm * 1.015
-    otm_put_1_target = atm * 0.985
-    otm_call_2_target = atm * 1.035
-    otm_put_2_target = atm * 0.965
+    r = 0.01
+    lo, hi = 1e-6, 5.0
 
-    def get_closest_strike(target: float, strikes: list[float]) -> float:
-        if not strikes:
-            raise RuntimeError("No strikes available.")
-        return float(min(strikes, key=lambda s: abs(float(s) - float(target))))
+    def N(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    atm_strike = get_closest_strike(atm, strikes)
-
-    c1 = get_closest_strike(otm_call_1_target, strikes)
-    p1 = get_closest_strike(otm_put_1_target, strikes)
-
-    c2 = get_closest_strike(otm_call_2_target, strikes)
-    p2 = get_closest_strike(otm_put_2_target, strikes)
-
-    sub = chain_df[chain_df["exp_yyyymmdd"] == exp]
-
-    raw_atm_c = sub[(sub["strike_price"] == atm_strike) & (sub["instrument_class"] == "C")]["raw_symbol"].iloc[0]
-    raw_atm_p = sub[(sub["strike_price"] == atm_strike) & (sub["instrument_class"] == "P")]["raw_symbol"].iloc[0]
-
-    raw_c1 = sub[(sub["strike_price"] == c1) & (sub["instrument_class"] == "C")]["raw_symbol"].iloc[0]
-    raw_p1 = sub[(sub["strike_price"] == p1) & (sub["instrument_class"] == "P")]["raw_symbol"].iloc[0]
-
-    raw_c2 = sub[(sub["strike_price"] == c2) & (sub["instrument_class"] == "C")]["raw_symbol"].iloc[0]
-    raw_p2 = sub[(sub["strike_price"] == p2) & (sub["instrument_class"] == "P")]["raw_symbol"].iloc[0]
-
-    df_quotes = client.timeseries.get_range(
-        dataset="OPRA.PILLAR",
-        schema="mbp-1",
-        symbols=[raw_atm_c, raw_atm_p, raw_c1, raw_p1, raw_c2, raw_p2],
-        stype_in="raw_symbol",
-        start=(now - dt.timedelta(seconds=10)).isoformat(),
-        end=now.isoformat(),
-    ).to_df()
-
-    def get_quote(raw_symbol):
-        df = client.timeseries.get_range(
-            dataset="OPRA.PILLAR",
-            schema="mbp-1",
-            symbols=[raw_symbol],
-            stype_in="raw_symbol",
-            start=(now - dt.timedelta(seconds=10)).isoformat(),
-            end=now.isoformat(),
-        ).to_df()
-
-        if df.empty:
-            return None
-
-        row = df.sort_values("ts_event").iloc[-1]
-
-        bid = row["bid_px_00"]
-        ask = row["ask_px_00"]
-
-        if bid and ask and bid > 0 and ask > 0:
-            mid = (bid + ask) / 2
-            spread = ask - bid
-            spread_pct = spread / mid
+    def bs_price(sigma: float) -> float:
+        d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if call_put == "C":
+            return S * N(d1) - K * math.exp(-r * T) * N(d2)
         else:
-            mid = spread = spread_pct = None
+            return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
 
-        return {
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread": spread,
-            "spread_pct": spread_pct,
-        }
+    for _ in range(60):
+        m = 0.5 * (lo + hi)
+        price = bs_price(m)
+        if price > mid:
+            hi = m
+        else:
+            lo = m
 
-    # ===== ATM CALL =====
-    q_atm_c = get_quote(raw_atm_c)
-    atm_call_bid = q_atm_c["bid"]
-    atm_call_ask = q_atm_c["ask"]
-    atm_call_mid = q_atm_c["mid"]
-    atm_call_spread = q_atm_c["spread"]
-    atm_call_spread_pct = q_atm_c["spread_pct"]
+    return 0.5 * (lo + hi)
 
-    # ===== ATM PUT =====
-    q_atm_p = get_quote(raw_atm_p)
-    atm_put_bid = q_atm_p["bid"]
-    atm_put_ask = q_atm_p["ask"]
-    atm_put_mid = q_atm_p["mid"]
-    atm_put_spread = q_atm_p["spread"]
-    atm_put_spread_pct = q_atm_p["spread_pct"]
 
-    # ===== OTM CALL 1 =====
-    q_c1 = get_quote(raw_c1)
-    otm_call_1_bid = q_c1["bid"]
-    otm_call_1_ask = q_c1["ask"]
-    otm_call_1_mid = q_c1["mid"]
-    otm_call_1_spread = q_c1["spread"]
-    otm_call_1_spread_pct = q_c1["spread_pct"]
+def time_decay_bucket(days: int) -> str:
+    if days <= 1:
+        return "EXTREME"
+    if days <= 3:
+        return "HIGH"
+    if days <= 7:
+        return "MEDIUM"
+    return "LOW"
 
-    # ===== OTM PUT 1 =====
-    q_p1 = get_quote(raw_p1)
-    otm_put_1_bid = q_p1["bid"]
-    otm_put_1_ask = q_p1["ask"]
-    otm_put_1_mid = q_p1["mid"]
-    otm_put_1_spread = q_p1["spread"]
-    otm_put_1_spread_pct = q_p1["spread_pct"]
 
-    # ===== OTM CALL 2 =====
-    q_c2 = get_quote(raw_c2)
-    otm_call_2_bid = q_c2["bid"]
-    otm_call_2_ask = q_c2["ask"]
-    otm_call_2_mid = q_c2["mid"]
-    otm_call_2_spread = q_c2["spread"]
-    otm_call_2_spread_pct = q_c2["spread_pct"]
+# -------------------------
+# SNAPSHOT (DB -> PARQUET)
+# -------------------------
+def run_db_option_snapshot_to_parquet(
+    run_id: str,
+    symbol: str,
+    shard_id: int,
+):
+    # read-only db connection (safer; streamer is writer)
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
 
-    # ===== OTM PUT 2 =====
-    q_p2 = get_quote(raw_p2)
-    otm_put_2_bid = q_p2["bid"]
-    otm_put_2_ask = q_p2["ask"]
-    otm_put_2_mid = q_p2["mid"]
-    otm_put_2_spread = q_p2["spread"]
-    otm_put_2_spread_pct = q_p2["spread_pct"]
+    six = get_sixpack_from_db(con, symbol)
+    if six is None or six.empty:
+        con.close()
+        return "no strikes6 in db"
 
-    def get_volume(raw_symbol):
-        df = client.timeseries.get_range(
-            dataset="OPRA.PILLAR",
-            schema="trades",
-            symbols=[raw_symbol],
-            stype_in="raw_symbol",
-            start=(now - dt.timedelta(minutes=10)).isoformat(),
-            end=now.isoformat(),
-        ).to_df()
-        return df["size"].sum() if not df.empty else 0
+    # -------------------------
+    # FRESHNESS GATE
+    # -------------------------
+    ts_series = six["ts_refresh"].dropna()
+    if ts_series.empty:
+        con.close()
+        return "no ts_refresh in strikes6"
 
-    vol_atm_c = get_volume(raw_atm_c)
-    vol_atm_p = get_volume(raw_atm_p)
+    ts_refresh = pd.to_datetime(ts_series.iloc[0], utc=True, errors="coerce")
+    if pd.isna(ts_refresh):
+        con.close()
+        return "bad ts_refresh in strikes6"
 
-    vol_c1 = get_volume(raw_c1)
-    vol_p1 = get_volume(raw_p1)
+    now = dt.datetime.now(tz=pytz.UTC)
+    age_min = (now - ts_refresh).total_seconds() / 60.0
+    if age_min > STRIKES_MAX_AGE_MIN:
+        con.close()
+        return f"stale strikes6 ({age_min:.1f} min old)"
 
-    vol_c2 = get_volume(raw_c2)
-    vol_p2 = get_volume(raw_p2)
+    # -------------------------
+    # UNDERLYING / EXPIRY
+    # -------------------------
+    underlying_price_series = six["underlying_price"].dropna()
+    if underlying_price_series.empty:
+        con.close()
+        return "no underlying_price in strikes6"
+    underlying_price = float(underlying_price_series.iloc[0])
 
-    def get_open_interest(raw_symbol):
-        df = client.timeseries.get_range(
-            dataset="OPRA.PILLAR",
-            schema="open_interest",
-            symbols=[raw_symbol],
-            stype_in="raw_symbol",
-            start=(dt.date.today() - dt.timedelta(days=1)),
-            end=(dt.date.today() - dt.timedelta(days=1)),
-        ).to_df()
-        return df["open_interest"].iloc[0] if not df.empty else None
+    exp_yyyymmdd = str(six["exp_yyyymmdd"].iloc[0])
+    exp_date = datetime.datetime.strptime(exp_yyyymmdd, "%Y%m%d").date()
 
-    oi_atm_c = get_open_interest(raw_atm_c)
-    oi_atm_p = get_open_interest(raw_atm_p)
+    today_utc = now.date()
+    days_till_expiry = int((exp_date - today_utc).days)
+    tdb = time_decay_bucket(days_till_expiry)
 
-    oi_c1 = get_open_interest(raw_c1)
-    oi_p1 = get_open_interest(raw_p1)
-
-    oi_c2 = get_open_interest(raw_c2)
-    oi_p2 = get_open_interest(raw_p2)
-
-    def get_iv(mid, S, K, days_to_expiry, call_put):
-        if mid is None or mid <= 0:
+    # -------------------------
+    # MAP SIX LEGS
+    # -------------------------
+    def pick_row(label: str, cp: str) -> pd.Series | None:
+        sub = six[(six["label"] == label) & (six["instrument_class"] == cp)]
+        if sub.empty:
             return None
+        return sub.iloc[0]
 
-        T = days_to_expiry / 365.0
-        if T <= 0:
-            return None
+    legs = [
+        ("ATM", "C", "ATM"),
+        ("ATM", "P", "ATM"),
+        ("C1", "C", "OTM_1"),
+        ("P1", "P", "OTM_1"),
+        ("C2", "C", "OTM_2"),
+        ("P2", "P", "OTM_2"),
+    ]
 
-        r = 0.01
-        lo, hi = 1e-6, 5.0  # 0% → 500%
+    leg_rows = []
+    for label, cp, bucket in legs:
+        r = pick_row(label, cp)
+        if r is None:
+            con.close()
+            return f"missing strikes6 row: {label} {cp}"
+        leg_rows.append((label, cp, bucket, r))
 
-        def N(x):
-            return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    # -------------------------
+    # PULL QUOTES / VOL / OI
+    # -------------------------
+    enriched = []
+    for label, cp, bucket, r in leg_rows:
+        raw = str(r["raw_symbol"])
+        strike = float(r["strike_price"])
 
-        def bs_price(sigma):
-            d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-            d2 = d1 - sigma * math.sqrt(T)
-            if call_put == "C":
-                return S * N(d1) - K * math.exp(-r * T) * N(d2)
-            else:
-                return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
+        q = get_quote_from_db(con, raw)
+        vol10m = get_vol10m_from_db(con, raw)
+        oi = get_oi_from_db(con, raw)
 
-        for _ in range(60):
-            mid_sigma = 0.5 * (lo + hi)
-            price = bs_price(mid_sigma)
-            if price > mid:
-                hi = mid_sigma
-            else:
-                lo = mid_sigma
+        enriched.append(
+            {
+                "label": label,
+                "call_put": cp,
+                "moneyness_bucket": bucket,
+                "raw_symbol": raw,
+                "strike": strike,
+                "bid": q["bid"],
+                "ask": q["ask"],
+                "mid": q["mid"],
+                "spread": q["spread"],
+                "spread_pct": q["spread_pct"],
+                "volume": int(vol10m),
+                "open_interest": oi,
+            }
+        )
 
-        return 0.5 * (lo + hi)
+    con.close()
 
-    est = pytz.timezone("US/Eastern")
-    now_est = datetime.datetime.now(est)
+    # require ATM mids
+    atm_call_mid = next(x["mid"] for x in enriched if x["label"] == "ATM" and x["call_put"] == "C")
+    atm_put_mid = next(x["mid"] for x in enriched if x["label"] == "ATM" and x["call_put"] == "P")
+    if atm_call_mid is None or atm_put_mid is None:
+        return "no live quotes yet"
 
-    timestamp = now_est.strftime("%Y-%m-%d %H:%M:%S")  # VALID TIMESTAMP
+    # -------------------------
+    # IV CALC
+    # -------------------------
+    for x in enriched:
+        x["iv"] = bs_iv_bisect(x["mid"], underlying_price, x["strike"], days_till_expiry, x["call_put"])
+
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     snapshot_id = f"{symbol}_{timestamp}"
 
-    exp_date = datetime.datetime.strptime(exp, "%Y%m%d").date()
-    now_date = now_est.date()
+    # (rest of your parquet / z-score / exec code continues unchanged)
 
-    days_till_expiry = (exp_date - now_date).days
-
-    if days_till_expiry <= 1:
-        time_decay_bucket = "EXTREME"
-    elif days_till_expiry <= 3:
-        time_decay_bucket = "HIGH"
-    elif days_till_expiry <= 7:
-        time_decay_bucket = "MEDIUM"
-    else:
-        time_decay_bucket = "LOW"
-
-    iv_atm_c = get_iv(q_atm_c["mid"], underlying_price, atm_strike, days_till_expiry, "C")
-    iv_atm_p = get_iv(q_atm_p["mid"], underlying_price, atm_strike, days_till_expiry, "P")
-
-    iv_c1 = get_iv(q_c1["mid"], underlying_price, c1, days_till_expiry, "C")
-    iv_p1 = get_iv(q_p1["mid"], underlying_price, p1, days_till_expiry, "P")
-
-    iv_c2 = get_iv(q_c2["mid"], underlying_price, c2, days_till_expiry, "C")
-    iv_p2 = get_iv(q_p2["mid"], underlying_price, p2, days_till_expiry, "P")
-
+    # -------------------------
+    # RAW parquet (same schema)
+    # -------------------------
     cols1 = [
-        "snapshot_id",
-        "timestamp",
-        "symbol",
-        "underlying_price",
-        "strike",
-        "call_put",
-        "days_to_expiry",
-        "expiration_date",
-        "moneyness_bucket",
-        "bid",
-        "ask",
-        "mid",
-        "volume",
-        "open_interest",
-        "iv",
-        "spread",
-        "spread_pct",
-        "time_decay_bucket",
+        "snapshot_id", "timestamp", "symbol", "underlying_price", "strike", "call_put",
+        "days_to_expiry", "expiration_date", "moneyness_bucket", "bid", "ask", "mid",
+        "volume", "open_interest", "iv", "spread", "spread_pct", "time_decay_bucket",
     ]
 
-    rows1 = [
-        # ===== ATM CALL =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            atm_strike,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "ATM",
-            atm_call_bid,
-            atm_call_ask,
-            atm_call_mid,
-            vol_atm_c,
-            oi_atm_c,
-            iv_atm_c,
-            atm_call_spread,
-            atm_call_spread_pct,
-            time_decay_bucket,
-        ],
-        # ===== ATM PUT =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            atm_strike,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "ATM",
-            atm_put_bid,
-            atm_put_ask,
-            atm_put_mid,
-            vol_atm_p,
-            oi_atm_p,
-            iv_atm_p,
-            atm_put_spread,
-            atm_put_spread_pct,
-            time_decay_bucket,
-        ],
-        # ===== OTM CALL 1 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            c1,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "OTM_1",
-            otm_call_1_bid,
-            otm_call_1_ask,
-            otm_call_1_mid,
-            vol_c1,
-            oi_c1,
-            iv_c1,
-            otm_call_1_spread,
-            otm_call_1_spread_pct,
-            time_decay_bucket,
-        ],
-        # ===== OTM PUT 1 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            p1,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "OTM_1",
-            otm_put_1_bid,
-            otm_put_1_ask,
-            otm_put_1_mid,
-            vol_p1,
-            oi_p1,
-            iv_p1,
-            otm_put_1_spread,
-            otm_put_1_spread_pct,
-            time_decay_bucket,
-        ],
-        # ===== OTM CALL 2 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            c2,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "OTM_2",
-            otm_call_2_bid,
-            otm_call_2_ask,
-            otm_call_2_mid,
-            vol_c2,
-            oi_c2,
-            iv_c2,
-            otm_call_2_spread,
-            otm_call_2_spread_pct,
-            time_decay_bucket,
-        ],
-        # ===== OTM PUT 2 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            p2,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "OTM_2",
-            otm_put_2_bid,
-            otm_put_2_ask,
-            otm_put_2_mid,
-            vol_p2,
-            oi_p2,
-            iv_p2,
-            otm_put_2_spread,
-            otm_put_2_spread_pct,
-            time_decay_bucket,
-        ],
-    ]
+    rows1 = []
+    for x in enriched:
+        rows1.append(
+            [
+                snapshot_id,
+                timestamp,
+                symbol,
+                float(underlying_price),
+                float(x["strike"]),
+                x["call_put"],
+                int(days_till_expiry),
+                exp_date,
+                x["moneyness_bucket"],
+                x["bid"],
+                x["ask"],
+                x["mid"],
+                int(x["volume"]),
+                x["open_interest"],
+                x["iv"],
+                x["spread"],
+                x["spread_pct"],
+                tdb,
+            ]
+        )
 
-    # ===== Raw =====
     df1 = pd.DataFrame(rows1, columns=cols1)
     df1 = stabilize_schema(df1)
+
     out_dir = f"runs/{run_id}/option_snapshots_raw"
     os.makedirs(out_dir, exist_ok=True)
     out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
     df1.to_parquet(out_path, index=False)
 
-    (
-        atm_call_mid_z_3d,
-        atm_call_vol_z_3d,
-        atm_call_iv_z_3d,
-        atm_call_mid_z_5w,
-        atm_call_vol_z_5w,
-        atm_call_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="ATM",
-        call_put="C",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=atm_call_mid,
-        current_volume=vol_atm_c,
-        current_iv=iv_atm_c,
-    )
+    # -------------------------
+    # Z-SCORES (same calls, just sourced from DB now)
+    # -------------------------
+    def cur(bucket: str, cp: str) -> dict:
+        for x in enriched:
+            if x["moneyness_bucket"] == bucket and x["call_put"] == cp:
+                return x
+        raise RuntimeError(f"missing leg {bucket} {cp}")
+
+    def z_for(bucket: str, cp: str):
+        x = cur(bucket, cp)
+        return compute_z_scores_for_bucket(
+            symbol=symbol,
+            bucket=bucket,
+            call_put=cp,
+            time_decay_bucket=tdb,
+            current_mid=x["mid"],
+            current_volume=x["volume"],
+            current_iv=x["iv"],
+        )
 
     (
-        atm_put_mid_z_3d,
-        atm_put_vol_z_3d,
-        atm_put_iv_z_3d,
-        atm_put_mid_z_5w,
-        atm_put_vol_z_5w,
-        atm_put_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="ATM",
-        call_put="P",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=atm_put_mid,
-        current_volume=vol_atm_p,
-        current_iv=iv_atm_p,
-    )
+        atm_call_mid_z_3d, atm_call_vol_z_3d, atm_call_iv_z_3d,
+        atm_call_mid_z_5w, atm_call_vol_z_5w, atm_call_iv_z_5w,
+    ) = z_for("ATM", "C")
 
     (
-        otm_call_1_mid_z_3d,
-        otm_call_1_vol_z_3d,
-        otm_call_1_iv_z_3d,
-        otm_call_1_mid_z_5w,
-        otm_call_1_vol_z_5w,
-        otm_call_1_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="OTM_1",
-        call_put="C",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=otm_call_1_mid,
-        current_volume=vol_c1,
-        current_iv=iv_c1,
-    )
+        atm_put_mid_z_3d, atm_put_vol_z_3d, atm_put_iv_z_3d,
+        atm_put_mid_z_5w, atm_put_vol_z_5w, atm_put_iv_z_5w,
+    ) = z_for("ATM", "P")
 
     (
-        otm_put_1_mid_z_3d,
-        otm_put_1_vol_z_3d,
-        otm_put_1_iv_z_3d,
-        otm_put_1_mid_z_5w,
-        otm_put_1_vol_z_5w,
-        otm_put_1_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="OTM_1",
-        call_put="P",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=otm_put_1_mid,
-        current_volume=vol_p1,
-        current_iv=iv_p1,
-    )
+        otm_call_1_mid_z_3d, otm_call_1_vol_z_3d, otm_call_1_iv_z_3d,
+        otm_call_1_mid_z_5w, otm_call_1_vol_z_5w, otm_call_1_iv_z_5w,
+    ) = z_for("OTM_1", "C")
 
     (
-        otm_call_2_mid_z_3d,
-        otm_call_2_vol_z_3d,
-        otm_call_2_iv_z_3d,
-        otm_call_2_mid_z_5w,
-        otm_call_2_vol_z_5w,
-        otm_call_2_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="OTM_2",
-        call_put="C",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=otm_call_2_mid,
-        current_volume=vol_c2,
-        current_iv=iv_c2,
-    )
+        otm_put_1_mid_z_3d, otm_put_1_vol_z_3d, otm_put_1_iv_z_3d,
+        otm_put_1_mid_z_5w, otm_put_1_vol_z_5w, otm_put_1_iv_z_5w,
+    ) = z_for("OTM_1", "P")
 
     (
-        otm_put_2_mid_z_3d,
-        otm_put_2_vol_z_3d,
-        otm_put_2_iv_z_3d,
-        otm_put_2_mid_z_5w,
-        otm_put_2_vol_z_5w,
-        otm_put_2_iv_z_5w,
-    ) = compute_z_scores_for_bucket(
-        symbol=symbol,
-        bucket="OTM_2",
-        call_put="P",
-        time_decay_bucket=time_decay_bucket,
-        current_mid=otm_put_2_mid,
-        current_volume=vol_p2,
-        current_iv=iv_p2,
-    )
+        otm_call_2_mid_z_3d, otm_call_2_vol_z_3d, otm_call_2_iv_z_3d,
+        otm_call_2_mid_z_5w, otm_call_2_vol_z_5w, otm_call_2_iv_z_5w,
+    ) = z_for("OTM_2", "C")
 
-    # ======================
-    # ENRICHED (5W)
-    # ======================
+    (
+        otm_put_2_mid_z_3d, otm_put_2_vol_z_3d, otm_put_2_iv_z_3d,
+        otm_put_2_mid_z_5w, otm_put_2_vol_z_5w, otm_put_2_iv_z_5w,
+    ) = z_for("OTM_2", "P")
+
+    # -------------------------
+    # ENRICHED parquet
+    # -------------------------
     cols2 = [
-        "snapshot_id",
-        "timestamp",
-        "symbol",
-        "underlying_price",  # ← added to match RAW
-        "strike",
-        "call_put",
-        "days_to_expiry",
-        "expiration_date",
-        "moneyness_bucket",
-        "bid",
-        "ask",
-        "mid",
-        "volume",
-        "open_interest",
-        "iv",
-        "spread",
-        "spread_pct",
+        "snapshot_id", "timestamp", "symbol", "underlying_price",
+        "strike", "call_put", "days_to_expiry", "expiration_date", "moneyness_bucket",
+        "bid", "ask", "mid", "volume", "open_interest", "iv", "spread", "spread_pct",
         "time_decay_bucket",
-        "mid_z_3d",
-        "volume_z_3d",
-        "iv_z_3d",
-        "mid_z_5w",
-        "volume_z_5w",
-        "iv_z_5w",
-        "opt_ret_10m",
-        "opt_ret_1h",
-        "opt_ret_eod",
-        "opt_ret_next_open",
-        "opt_ret_1d",
-        "opt_ret_exp",
+        "mid_z_3d", "volume_z_3d", "iv_z_3d",
+        "mid_z_5w", "volume_z_5w", "iv_z_5w",
+        "opt_ret_10m", "opt_ret_1h", "opt_ret_eod", "opt_ret_next_open", "opt_ret_1d", "opt_ret_exp",
     ]
+
+    def pack_row(bucket: str, cp: str, mid_z_3d, vol_z_3d, iv_z_3d, mid_z_5w, vol_z_5w, iv_z_5w):
+        x = cur(bucket, cp)
+        return [
+            snapshot_id, timestamp, symbol, float(underlying_price),
+            float(x["strike"]), cp, int(days_till_expiry), exp_date, bucket,
+            x["bid"], x["ask"], x["mid"], int(x["volume"]), x["open_interest"], x["iv"],
+            x["spread"], x["spread_pct"], tdb,
+            mid_z_3d, vol_z_3d, iv_z_3d,
+            mid_z_5w, vol_z_5w, iv_z_5w,
+            None, None, None, None, None, None,
+        ]
 
     rows2 = [
-        # ===== ATM CALL =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            atm_strike,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "ATM",
-            atm_call_bid,
-            atm_call_ask,
-            atm_call_mid,
-            vol_atm_c,
-            oi_atm_c,
-            iv_atm_c,
-            atm_call_spread,
-            atm_call_spread_pct,
-            time_decay_bucket,
-            atm_call_mid_z_3d,
-            atm_call_vol_z_3d,
-            atm_call_iv_z_3d,
-            atm_call_mid_z_5w,
-            atm_call_vol_z_5w,
-            atm_call_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
-        # ===== ATM PUT =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            atm_strike,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "ATM",
-            atm_put_bid,
-            atm_put_ask,
-            atm_put_mid,
-            vol_atm_p,
-            oi_atm_p,
-            iv_atm_p,
-            atm_put_spread,
-            atm_put_spread_pct,
-            time_decay_bucket,
-            atm_put_mid_z_3d,
-            atm_put_vol_z_3d,
-            atm_put_iv_z_3d,
-            atm_put_mid_z_5w,
-            atm_put_vol_z_5w,
-            atm_put_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM CALL 1 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            c1,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "OTM_1",
-            otm_call_1_bid,
-            otm_call_1_ask,
-            otm_call_1_mid,
-            vol_c1,
-            oi_c1,
-            iv_c1,
-            otm_call_1_spread,
-            otm_call_1_spread_pct,
-            time_decay_bucket,
-            otm_call_1_mid_z_3d,
-            otm_call_1_vol_z_3d,
-            otm_call_1_iv_z_3d,
-            otm_call_1_mid_z_5w,
-            otm_call_1_vol_z_5w,
-            otm_call_1_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM PUT 1 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            p1,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "OTM_1",
-            otm_put_1_bid,
-            otm_put_1_ask,
-            otm_put_1_mid,
-            vol_p1,
-            oi_p1,
-            iv_p1,
-            otm_put_1_spread,
-            otm_put_1_spread_pct,
-            time_decay_bucket,
-            otm_put_1_mid_z_3d,
-            otm_put_1_vol_z_3d,
-            otm_put_1_iv_z_3d,
-            otm_put_1_mid_z_5w,
-            otm_put_1_vol_z_5w,
-            otm_put_1_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM CALL 2 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            c2,
-            "C",
-            days_till_expiry,
-            exp_date,
-            "OTM_2",
-            otm_call_2_bid,
-            otm_call_2_ask,
-            otm_call_2_mid,
-            vol_c2,
-            oi_c2,
-            iv_c2,
-            otm_call_2_spread,
-            otm_call_2_spread_pct,
-            time_decay_bucket,
-            otm_call_2_mid_z_3d,
-            otm_call_2_vol_z_3d,
-            otm_call_2_iv_z_3d,
-            otm_call_2_mid_z_5w,
-            otm_call_2_vol_z_5w,
-            otm_call_2_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM PUT 2 =====
-        [
-            snapshot_id,
-            timestamp,
-            symbol,
-            underlying_price,
-            p2,
-            "P",
-            days_till_expiry,
-            exp_date,
-            "OTM_2",
-            otm_put_2_bid,
-            otm_put_2_ask,
-            otm_put_2_mid,
-            vol_p2,
-            oi_p2,
-            iv_p2,
-            otm_put_2_spread,
-            otm_put_2_spread_pct,
-            time_decay_bucket,
-            otm_put_2_mid_z_3d,
-            otm_put_2_vol_z_3d,
-            otm_put_2_iv_z_3d,
-            otm_put_2_mid_z_5w,
-            otm_put_2_vol_z_5w,
-            otm_put_2_iv_z_5w,
-            None, None, None, None, None, None,
-        ],
+        pack_row("ATM", "C", atm_call_mid_z_3d, atm_call_vol_z_3d, atm_call_iv_z_3d, atm_call_mid_z_5w, atm_call_vol_z_5w, atm_call_iv_z_5w),
+        pack_row("ATM", "P", atm_put_mid_z_3d, atm_put_vol_z_3d, atm_put_iv_z_3d, atm_put_mid_z_5w, atm_put_vol_z_5w, atm_put_iv_z_5w),
+        pack_row("OTM_1", "C", otm_call_1_mid_z_3d, otm_call_1_vol_z_3d, otm_call_1_iv_z_3d, otm_call_1_mid_z_5w, otm_call_1_vol_z_5w, otm_call_1_iv_z_5w),
+        pack_row("OTM_1", "P", otm_put_1_mid_z_3d, otm_put_1_vol_z_3d, otm_put_1_iv_z_3d, otm_put_1_mid_z_5w, otm_put_1_vol_z_5w, otm_put_1_iv_z_5w),
+        pack_row("OTM_2", "C", otm_call_2_mid_z_3d, otm_call_2_vol_z_3d, otm_call_2_iv_z_3d, otm_call_2_mid_z_5w, otm_call_2_vol_z_5w, otm_call_2_iv_z_5w),
+        pack_row("OTM_2", "P", otm_put_2_mid_z_3d, otm_put_2_vol_z_3d, otm_put_2_iv_z_3d, otm_put_2_mid_z_5w, otm_put_2_vol_z_5w, otm_put_2_iv_z_5w),
     ]
 
-    # ===== Enriched =====
     df2 = pd.DataFrame(rows2, columns=cols2)
     df2 = stabilize_schema(df2)
+
     out_dir = f"runs/{run_id}/option_snapshots_enriched"
     os.makedirs(out_dir, exist_ok=True)
     out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
     df2.to_parquet(out_path, index=False)
 
-    # ======================
-    # EXECUTION SIGNALS (5W)
-    # ======================
+    # -------------------------
+    # EXECUTION SIGNALS parquet
+    # -------------------------
     cols3 = [
-        "snapshot_id",
-        "timestamp",
-        "symbol",
-        "underlying_price",  # ← added
-        "strike",
-        "call_put",
-        "days_to_expiry",
-        "expiration_date",
-        "moneyness_bucket",
-        "bid",
-        "ask",
-        "mid",
-        "volume",
-        "open_interest",
-        "iv",
-        "spread",
-        "spread_pct",
+        "snapshot_id", "timestamp", "symbol", "underlying_price",
+        "strike", "call_put", "days_to_expiry", "expiration_date", "moneyness_bucket",
+        "bid", "ask", "mid", "volume", "open_interest", "iv", "spread", "spread_pct",
         "time_decay_bucket",
-        "mid_z_3d",
-        "volume_z_3d",
-        "iv_z_3d",
-        "mid_z_5w",
-        "volume_z_5w",
-        "iv_z_5w",
-        "opt_ret_10m",
-        "opt_ret_1h",
-        "opt_ret_eod",
-        "opt_ret_next_open",
-        "opt_ret_1d",
-        "opt_ret_exp",
-        "atm_call_signal",
-        "atm_put_signal",
-        "otm1_call_signal",
-        "otm1_put_signal",
-        "otm2_call_signal",
-        "otm2_put_signal",
+        "mid_z_3d", "volume_z_3d", "iv_z_3d",
+        "mid_z_5w", "volume_z_5w", "iv_z_5w",
+        "opt_ret_10m", "opt_ret_1h", "opt_ret_eod", "opt_ret_next_open", "opt_ret_1d", "opt_ret_exp",
+        "atm_call_signal", "atm_put_signal", "otm1_call_signal", "otm1_put_signal", "otm2_call_signal", "otm2_put_signal",
     ]
+
+    def pack_exec(bucket: str, cp: str, mid_z_3d, vol_z_3d, iv_z_3d, mid_z_5w, vol_z_5w, iv_z_5w):
+        x = cur(bucket, cp)
+        return [
+            snapshot_id, timestamp, symbol, float(underlying_price),
+            float(x["strike"]), cp, int(days_till_expiry), exp_date, bucket,
+            x["bid"], x["ask"], x["mid"], int(x["volume"]), x["open_interest"], x["iv"],
+            x["spread"], x["spread_pct"], tdb,
+            mid_z_3d, vol_z_3d, iv_z_3d,
+            mid_z_5w, vol_z_5w, iv_z_5w,
+            None, None, None, None, None, None,
+            None, None, None, None, None, None,
+        ]
 
     rows3 = [
-        # ===== ATM CALL =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            atm_strike, "C",
-            days_till_expiry, exp_date, "ATM",
-            atm_call_bid, atm_call_ask, atm_call_mid,
-            vol_atm_c, oi_atm_c, iv_atm_c,
-            atm_call_spread, atm_call_spread_pct,
-            time_decay_bucket,
-            atm_call_mid_z_3d, atm_call_vol_z_3d, atm_call_iv_z_3d,
-            atm_call_mid_z_5w, atm_call_vol_z_5w, atm_call_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
-        # ===== ATM PUT =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            atm_strike, "P",
-            days_till_expiry, exp_date, "ATM",
-            atm_put_bid, atm_put_ask, atm_put_mid,
-            vol_atm_p, oi_atm_p, iv_atm_p,
-            atm_put_spread, atm_put_spread_pct,
-            time_decay_bucket,
-            atm_put_mid_z_3d, atm_put_vol_z_3d, atm_put_iv_z_3d,
-            atm_put_mid_z_5w, atm_put_vol_z_5w, atm_put_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM CALL 1 =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            c1, "C",
-            days_till_expiry, exp_date, "OTM_1",
-            otm_call_1_bid, otm_call_1_ask, otm_call_1_mid,
-            vol_c1, oi_c1, iv_c1,
-            otm_call_1_spread, otm_call_1_spread_pct,
-            time_decay_bucket,
-            otm_call_1_mid_z_3d, otm_call_1_vol_z_3d, otm_call_1_iv_z_3d,
-            otm_call_1_mid_z_5w, otm_call_1_vol_z_5w, otm_call_1_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM PUT 1 =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            p1, "P",
-            days_till_expiry, exp_date, "OTM_1",
-            otm_put_1_bid, otm_put_1_ask, otm_put_1_mid,
-            vol_p1, oi_p1, iv_p1,
-            otm_put_1_spread, otm_put_1_spread_pct,
-            time_decay_bucket,
-            otm_put_1_mid_z_3d, otm_put_1_vol_z_3d, otm_put_1_iv_z_3d,
-            otm_put_1_mid_z_5w, otm_put_1_vol_z_5w, otm_put_1_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM CALL 2 =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            c2, "C",
-            days_till_expiry, exp_date, "OTM_2",
-            otm_call_2_bid, otm_call_2_ask, otm_call_2_mid,
-            vol_c2, oi_c2, iv_c2,
-            otm_call_2_spread, otm_call_2_spread_pct,
-            time_decay_bucket,
-            otm_call_2_mid_z_3d, otm_call_2_vol_z_3d, otm_call_2_iv_z_3d,
-            otm_call_2_mid_z_5w, otm_call_2_vol_z_5w, otm_call_2_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
-        # ===== OTM PUT 2 =====
-        [
-            snapshot_id, timestamp, symbol, underlying_price,
-            p2, "P",
-            days_till_expiry, exp_date, "OTM_2",
-            otm_put_2_bid, otm_put_2_ask, otm_put_2_mid,
-            vol_p2, oi_p2, iv_p2,
-            otm_put_2_spread, otm_put_2_spread_pct,
-            time_decay_bucket,
-            otm_put_2_mid_z_3d, otm_put_2_vol_z_3d, otm_put_2_iv_z_3d,
-            otm_put_2_mid_z_5w, otm_put_2_vol_z_5w, otm_put_2_iv_z_5w,
-            None, None, None, None, None, None,
-            None, None, None, None, None, None,
-        ],
+        pack_exec("ATM", "C", atm_call_mid_z_3d, atm_call_vol_z_3d, atm_call_iv_z_3d, atm_call_mid_z_5w, atm_call_vol_z_5w, atm_call_iv_z_5w),
+        pack_exec("ATM", "P", atm_put_mid_z_3d, atm_put_vol_z_3d, atm_put_iv_z_3d, atm_put_mid_z_5w, atm_put_vol_z_5w, atm_put_iv_z_5w),
+        pack_exec("OTM_1", "C", otm_call_1_mid_z_3d, otm_call_1_vol_z_3d, otm_call_1_iv_z_3d, otm_call_1_mid_z_5w, otm_call_1_vol_z_5w, otm_call_1_iv_z_5w),
+        pack_exec("OTM_1", "P", otm_put_1_mid_z_3d, otm_put_1_vol_z_3d, otm_put_1_iv_z_3d, otm_put_1_mid_z_5w, otm_put_1_vol_z_5w, otm_put_1_iv_z_5w),
+        pack_exec("OTM_2", "C", otm_call_2_mid_z_3d, otm_call_2_vol_z_3d, otm_call_2_iv_z_3d, otm_call_2_mid_z_5w, otm_call_2_vol_z_5w, otm_call_2_iv_z_5w),
+        pack_exec("OTM_2", "P", otm_put_2_mid_z_3d, otm_put_2_vol_z_3d, otm_put_2_iv_z_3d, otm_put_2_mid_z_5w, otm_put_2_vol_z_5w, otm_put_2_iv_z_5w),
     ]
 
-    # ===== Execution Signals =====
     df3 = pd.DataFrame(rows3, columns=cols3)
     df3 = stabilize_schema(df3)
+
     out_dir = f"runs/{run_id}/option_snapshots_execution_signals"
     os.makedirs(out_dir, exist_ok=True)
     out_path = f"{out_dir}/shard_{shard_id}_{symbol}.parquet"
     df3.to_parquet(out_path, index=False)
 
-
+    return "ok"
