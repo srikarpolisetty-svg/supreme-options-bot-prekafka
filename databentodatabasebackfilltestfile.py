@@ -924,14 +924,18 @@ def main():
 
     ensure_table()
 
-    # get symbols from DB (requires a connection)
-    con = duckdb.connect(DB_PATH, read_only=True)
-    try:
-        symbols = get_all_symbolsTester(con)   # <-- pass con
-    finally:
-        con.close()
+    # 🔹 Manual symbol universe (short list)
+    symbols = [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "AMD",
+        "TSLA",
+    ]
 
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
+
+    # Sharding still works the same
     my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
     log(f"[BOOT] shard={args.shard_id}/{args.n_shards} symbols_in_shard={len(my_symbols)} days_back={args.days_back}")
