@@ -5,24 +5,16 @@ cd "$(dirname "$0")"
 
 # ---- CONFIG ----
 RUN_ID="r001"
-N_SHARDS=8
 LOG_DIR="logs"
+SCRIPT="databentodatabasebackfillworkingversion.py"
 # ----------------
 
 mkdir -p $LOG_DIR
 
-echo "Starting options pipeline | run_id=$RUN_ID | shards=$N_SHARDS"
+echo "Starting options pipeline | run_id=$RUN_ID"
 
-for (( i=0; i<$N_SHARDS; i++ ))
-do
-  echo "Launching shard $i"
-  python databentodatabasebackfill.py \
-    --shard-id $i \
-    --n-shards $N_SHARDS \
-    > $LOG_DIR/shard_$i.log 2>&1 &
-done
+# single normal run, still logging
+python $SCRIPT \
+  > $LOG_DIR/run_$RUN_ID.log 2>&1
 
-echo "All shards launched. Waiting for completion..."
-wait
-
-echo "All shards finished."
+echo "Run finished."

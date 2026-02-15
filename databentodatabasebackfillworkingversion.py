@@ -10,6 +10,8 @@ import zlib
 import time
 import operator
 import pathlib
+import shutil
+
 
 from databasefunctions import get_sp500_symbols
 
@@ -26,6 +28,8 @@ POLL_S = 2.0
 DEF_CHUNK_SIZE = 100
 
 
+
+
 # ---------- TIME RANGE (Databento-safe end boundary) ----------
 def db_end_utc_day() -> datetime:
     """
@@ -34,6 +38,19 @@ def db_end_utc_day() -> datetime:
     Clamp end to the start of the current UTC day.
     """
     return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def clamp_end(dataset: str, end: datetime) -> datetime:
+    """
+    Clamp requested `end` to Databento's actual available dataset end to prevent 422.
+    """
+    rng = client.metadata.get_dataset_range(dataset)
+    avail_end = pd.Timestamp(rng["end"]).to_pydatetime()
+    if avail_end.tzinfo is None:
+        avail_end = avail_end.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return min(end, avail_end)
 
 
 # ---------- DB ----------
@@ -463,7 +480,7 @@ def parent_to_underlying(parent_val: str) -> str:
 
 # ---------- ✅ SHARD TWO-PHASE (defs batched; data batched) ----------
 def run_shard_two_phase(symbols: list[str], days_back: int = 35):
-    end = db_end_utc_day()
+    end = clamp_end("OPRA.PILLAR", db_end_utc_day())
     start = end - timedelta(days=days_back)
 
     # ---------- PHASE 1A: underlying per symbol (still per-symbol; unavoidable) ----------
@@ -507,7 +524,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 stype_in="parent",
                 symbols=parents,
                 start=start,
-                end=end - timedelta(hours=24),
+                end=end - timedelta(hours=48),
             )
             df_defs_all = defs.to_df()
         except Exception as e:
@@ -517,7 +534,6 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 half = max(1, len(sym_chunk) // 2)
                 print(f"[DEGRADE] retrying in chunks of {half}")
                 for sub in chunk_list(sym_chunk, half):
-                    # recurse by calling run_shard_two_phase is overkill; just do inline:
                     parents2 = [f"{s}.OPT" for s in sub]
                     try:
                         defs2 = client.timeseries.get_range(
@@ -627,12 +643,14 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
     print(f"[INFO] shard union raw_symbols={len(union_raw_list):,} -> ONE batch per schema")
 
     # ---------- PHASE 2: ONE batch per schema ----------
+    end_batch = end - timedelta(hours=48)
+
     mkt_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
         schema="cbbo-1m",
         symbols=union_raw_list,
         start=start,
-        end=end,
+        end=end_batch,
         stype_in="raw_symbol",
         split_duration="day",
         poll_s=POLL_S,
@@ -643,7 +661,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         schema="trades",
         symbols=union_raw_list,
         start=start,
-        end=end,
+        end=end_batch,
         stype_in="raw_symbol",
         split_duration="day",
         poll_s=POLL_S,
@@ -654,7 +672,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         schema="statistics",
         symbols=union_raw_list,
         start=start - pd.Timedelta(days=1),
-        end=end,
+        end=end_batch,
         stype_in="raw_symbol",
         split_duration="day",
         poll_s=POLL_S,
@@ -809,11 +827,19 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         print(f"✅ {symbol}: inserted {len(df):,} rows")
 
 
-# ---------- MAIN ----------
+
+
+
+def wipe_batch_downloads():
+    if BATCH_DIR.name != "batch_downloads":
+        raise RuntimeError(f"Refusing to wipe unexpected dir: {BATCH_DIR}")
+    if BATCH_DIR.exists():
+        shutil.rmtree(BATCH_DIR, ignore_errors=True)
+    BATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--shard-id", type=int, required=True)
-    parser.add_argument("--n-shards", type=int, required=True)
     parser.add_argument("--days-back", type=int, default=35)
     args = parser.parse_args()
 
@@ -821,13 +847,23 @@ def main():
 
     symbols = get_sp500_symbols()
     symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
-    my_symbols = [s for s in symbols if stable_shard(s, args.n_shards) == args.shard_id]
 
-    print(f"[INFO] shard={args.shard_id}/{args.n_shards} symbols={len(my_symbols)} days_back={args.days_back}")
+    print(f"[INFO] symbols={len(symbols)} days_back={args.days_back}")
 
-    # ✅ now uses shard-level two-phase: defs batched, data batched
-    run_shard_two_phase(my_symbols, days_back=args.days_back)
+    for i, sym in enumerate(symbols, start=1):
+        print(f"\n[RUN] {i}/{len(symbols)} symbol={sym}")
+        try:
+            run_shard_two_phase([sym], days_back=args.days_back)
+        except Exception as e:
+            print(f"[ERROR] symbol={sym} crashed:")
+            print(" ", repr(e))
+            import traceback
+            print(traceback.format_exc())
+            print("[CONTINUE] moving to next symbol...")
+        finally:
+            wipe_batch_downloads()
 
 
 if __name__ == "__main__":
     main()
+

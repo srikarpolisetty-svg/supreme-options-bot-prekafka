@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from config import DATABENTO_API_KEY
 import duckdb
 import math
-from execution_functions import get_all_symbols
+from execution_functions import get_all_symbolsTester
 import os
 import traceback
 
@@ -21,7 +21,7 @@ MAX_CHECKS = 50
 PRINT_PER_TIMESTAMP_HEADER = True
 PRINT_DB_ROWS_PREVIEW = False         # print the raw DB row dicts (can be noisy)
 PRINT_EACH_CONTRACT_VALUES = True     # print a line per contract with DB + live values
-PRINT_ONLY_MISMATCHES = False         # if True, only prints per-contract lines when any mismatch occurs
+PRINT_ONLY_MISMATCHES = True         # if True, only prints per-contract lines when any mismatch occurs
 MAX_CONTRACT_LINES_PER_TS = None      # None = print all contracts; or set e.g. 12
 
 # tolerances for quotes
@@ -106,12 +106,9 @@ def ok_int(db_v, live_v, abs_tol, pct_tol) -> bool:
 
 
 # ==============================
-# DEFINITIONS MAP
+# DEFINITIONS MAP (AS-OF)
 # ==============================
-def build_def_map(symbol: str, start: datetime, end: datetime) -> dict:
-    """
-    (exp_date, strike, side) -> raw_symbol
-    """
+def pull_defs_df(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
     defs = client.timeseries.get_range(
         dataset="OPRA.PILLAR",
         schema="definition",
@@ -122,19 +119,46 @@ def build_def_map(symbol: str, start: datetime, end: datetime) -> dict:
     )
     df = defs.to_df()
     if df is None or df.empty:
-        return {}
+        return pd.DataFrame()
 
     df = df.copy()
+
+    # pick timestamp col Databento used
+    tcol = "ts_event" if "ts_event" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+    if tcol is None:
+        return pd.DataFrame()
+
+    _ensure_utc_col(df, tcol)
+    df["tcol"] = df[tcol]  # unify name
+
     df["exp_date"] = pd.to_datetime(df["expiration"]).dt.date
     df["strike_f"] = df["strike_price"].astype(float)
     df["side"] = df["instrument_class"].astype(str)
     df["raw_symbol"] = df["raw_symbol"].astype(str)
 
-    df = df.dropna(subset=["exp_date", "strike_f", "side", "raw_symbol"])
-    df = df.drop_duplicates(subset=["exp_date", "strike_f", "side"], keep="last")
+    df = df.dropna(subset=["tcol", "exp_date", "strike_f", "side", "raw_symbol"])
+    return df
 
-    keys = list(zip(df["exp_date"].tolist(), df["strike_f"].tolist(), df["side"].tolist()))
-    vals = df["raw_symbol"].tolist()
+
+def build_def_map_asof(df_defs: pd.DataFrame, ts: pd.Timestamp) -> dict:
+    """
+    Build (exp_date, strike, side) -> raw_symbol using only definitions known <= ts.
+    """
+    if df_defs is None or df_defs.empty:
+        return {}
+
+    ts = to_utc_ts(ts)
+
+    d = df_defs[df_defs["tcol"] <= ts].copy()
+    if d.empty:
+        return {}
+
+    # latest definition wins, but only among rows that existed by ts
+    d = d.sort_values("tcol")
+    d = d.drop_duplicates(subset=["exp_date", "strike_f", "side"], keep="last")
+
+    keys = list(zip(d["exp_date"].tolist(), d["strike_f"].tolist(), d["side"].tolist()))
+    vals = d["raw_symbol"].tolist()
     return dict(zip(keys, vals))
 
 
@@ -315,7 +339,7 @@ def main():
     try:
         # ✅ FIX: get symbols from DB using the open connection
         try:
-            symbols = get_all_symbols(con)
+            symbols = get_all_symbolsTester(con)
         except Exception as e:
             print("\n[ERROR] get_all_symbols(con) crashed:")
             print(" ", repr(e))
@@ -387,19 +411,19 @@ def main():
             symbol = symbol.strip().upper()
 
             try:
-                def_map = build_def_map(symbol, start_utc, end_utc)
+                df_defs_all = pull_defs_df(symbol, start_utc, end_utc)
             except Exception as e:
-                print(f"\n[ERROR] build_def_map failed for {symbol}:")
+                print(f"\n[ERROR] pull_defs_df failed for {symbol}:")
                 print(" ", repr(e))
                 print(traceback.format_exc())
                 continue
 
-            if not def_map:
+            if df_defs_all is None or df_defs_all.empty:
                 print(f"[SKIP] {symbol}: no OPRA definitions -> cannot map raw_symbol")
                 continue
 
             print(f"\n[INFO] validate symbol={symbol} days_back={DAYS_BACK}")
-            print(f"[INFO] def_map keys={len(def_map):,}")
+            print(f"[INFO] defs_rows={len(df_defs_all):,}")
 
             try:
                 ts_df = con.execute(
@@ -443,6 +467,13 @@ def main():
             for i, ts in enumerate(timestamps, start=1):
                 ts = to_utc_ts(ts)
                 ts_db = to_utc_naive_dt(ts)
+
+                # build AS-OF def_map for this timestamp
+                def_map = build_def_map_asof(df_defs_all, ts)
+                if not def_map:
+                    print(f"[{i:02d}] {ts.isoformat()} -> FAIL (no defs as-of ts)")
+                    fail_ct += 1
+                    continue
 
                 try:
                     rows = con.execute(
