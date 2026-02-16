@@ -31,9 +31,16 @@ print(exp_df)
 sample_df = con.execute("""
 SELECT *
 FROM option_snapshots_raw
+WHERE symbol IN (
+    SELECT DISTINCT symbol
+    FROM option_snapshots_raw
+    LIMIT 5
+)
+ORDER BY symbol, timestamp
 LIMIT 50
 """).df()
-print("\n=== SAMPLE ROWS ===")
+
+print("\n=== SAMPLE ROWS (MULTI-SYMBOL) ===")
 print(sample_df)
 
 con.close()
