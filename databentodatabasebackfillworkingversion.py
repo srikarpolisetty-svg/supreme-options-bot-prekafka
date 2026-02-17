@@ -26,7 +26,9 @@ POLL_S = 2.0
 
 # Definitions batching (practical safe chunk)
 DEF_CHUNK_SIZE = 100
-
+# --- add these right under your existing constants (NO OTHER CHANGES) ---
+QUOTE_LOOKBACK = pd.Timedelta(hours=1)
+MAX_QUOTE_AGE  = pd.Timedelta(hours=1)
 
 
 
@@ -223,6 +225,13 @@ def get_contract_data_from_dfs_fast(
     """
     Same output as get_contract_data_from_dfs, but uses def_map instead of df_defs filtering.
     """
+    # --- ensure ts is UTC-aware (NO OTHER CHANGES) ---
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+
     symbols = {}
     for strike, side in strike_sides:
         symbols[(strike, side)] = def_map.get((float(strike), str(side), exp_date))
@@ -256,7 +265,7 @@ def get_contract_data_from_dfs_fast(
         if g_oi is not None and not g_oi.empty and oi_tcol:
             g_oi2 = g_oi[g_oi[oi_tcol] <= ts]
             if not g_oi2.empty:
-                open_interest = g_oi2.iloc[-1].get("open_interest", None)
+                open_interest = g_oi2.loc[g_oi2[oi_tcol].idxmax()].get("open_interest", None)
 
         g_trd = trd_groups.get(rs)
         if g_trd is not None and not g_trd.empty and "size" in g_trd.columns and trd_tcol:
@@ -270,14 +279,16 @@ def get_contract_data_from_dfs_fast(
             out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
             continue
 
-        last_row = g_mkt[g_mkt[mkt_tcol] <= ts].tail(1)
-        if last_row.empty:
+        g_mkt2 = g_mkt[g_mkt[mkt_tcol] <= ts]
+        if g_mkt2.empty:
             out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
             continue
-        last = last_row.iloc[0]
 
-        bid = float(last.get("bid_px", 0) or 0)
-        ask = float(last.get("ask_px", 0) or 0)
+        # ✅ pick the row with the latest timestamp (works even if g_mkt2 is unsorted)
+        last = g_mkt2.loc[g_mkt2[mkt_tcol].idxmax()]
+
+        bid = float(last.get("bid_px_00", 0) or 0)
+        ask = float(last.get("ask_px_00", 0) or 0)
 
         if bid and ask:
             mid = (bid + ask) / 2.0
@@ -315,7 +326,6 @@ def get_contract_data_from_dfs_fast(
         out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
 
     return out
-
 
 # ---------- BATCH DOWNLOAD ----------
 def _to_iso(x) -> str:
@@ -656,6 +666,21 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         poll_s=POLL_S,
     )
 
+    print("\n[DEBUG CBBO COLUMNS]")
+    print(sorted(mkt_df_all.columns))
+    print("[DEBUG SAMPLE ROWS]")
+    print(mkt_df_all.head(5))
+    print("[DEBUG NONZERO BIDS]")
+    print(mkt_df_all[mkt_df_all["bid_px_00"] > 0].head(5))
+    print()
+    print("[DEBUG NONZERO BIDS]")
+    if "bid_px_00" in mkt_df_all.columns:
+        print(mkt_df_all[mkt_df_all["bid_px_00"] > 0].head(5))
+    elif "bid_px" in mkt_df_all.columns:
+        print(mkt_df_all[mkt_df_all["bid_px"] > 0].head(5))
+    else:
+        print("[DEBUG] no bid_px column found")
+    print()
     trd_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
         schema="trades",
@@ -678,6 +703,18 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         poll_s=POLL_S,
     )
 
+
+    if oi_df_all is None or oi_df_all.empty:
+        pass
+    else:
+        if "stat_type" in oi_df_all.columns:
+            oi_df_all = oi_df_all[oi_df_all["stat_type"] == db.StatType.OPEN_INTEREST].copy()
+
+        if "quantity" in oi_df_all.columns and "open_interest" not in oi_df_all.columns:
+            oi_df_all = oi_df_all.rename(columns={"quantity": "open_interest"})
+
+        keep_cols = [c for c in ["symbol", "ts_event", "timestamp", "open_interest"] if c in oi_df_all.columns]
+        oi_df_all = oi_df_all[keep_cols].copy()
     # normalize timestamp cols once
     mkt_tcol = "ts_event" if "ts_event" in mkt_df_all.columns else ("timestamp" if "timestamp" in mkt_df_all.columns else None)
     trd_tcol = "ts_event" if "ts_event" in trd_df_all.columns else ("timestamp" if "timestamp" in trd_df_all.columns else None)
@@ -734,10 +771,13 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 continue
 
             # filter GLOBAL dfs down to this symbol's raw_needed AND this hour
+            # CHANGE: include lookback so "latest <= ts" has a chance to exist
             if mkt_tcol and not mkt_df_all.empty:
+                win_start_mkt = window_start - QUOTE_LOOKBACK
+                win_end_mkt   = window_end
                 mkt_df_win = mkt_df_all[
-                    (mkt_df_all[mkt_tcol] >= window_start) &
-                    (mkt_df_all[mkt_tcol] < window_end) &
+                    (mkt_df_all[mkt_tcol] >= win_start_mkt) &
+                    (mkt_df_all[mkt_tcol] <  win_end_mkt) &
                     (mkt_df_all["symbol"].isin(raw_needed))
                 ].copy()
             else:
@@ -862,6 +902,34 @@ def main():
             print("[CONTINUE] moving to next symbol...")
         finally:
             wipe_batch_downloads()
+
+def main1():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days-back", type=int, default=35)
+    args = parser.parse_args()
+
+    ensure_table()
+
+    # symbols = get_sp500_symbols()
+    # symbols = [s.strip().upper() for s in symbols if s and isinstance(s, str)]
+
+    symbols = ["AAPL"]   # <-- ONLY APPLE
+
+    print(f"[INFO] symbols={len(symbols)} days_back={args.days_back}")
+
+    for i, sym in enumerate(symbols, start=1):
+        print(f"\n[RUN] {i}/{len(symbols)} symbol={sym}")
+        try:
+            run_shard_two_phase([sym], days_back=args.days_back)
+        except Exception as e:
+            print(f"[ERROR] symbol={sym} crashed:")
+            print(" ", repr(e))
+            import traceback
+            print(traceback.format_exc())
+            print("[CONTINUE] moving to next symbol...")
+        finally:
+            wipe_batch_downloads()
+
 
 
 if __name__ == "__main__":

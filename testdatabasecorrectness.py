@@ -108,6 +108,9 @@ def ok_int(db_v, live_v, abs_tol, pct_tol) -> bool:
 # ==============================
 # DEFINITIONS MAP (AS-OF)
 # ==============================
+# ==============================
+# ✅ DEFINITIONS FIX (AS-OF)
+# ==============================
 def pull_defs_df(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
     defs = client.timeseries.get_range(
         dataset="OPRA.PILLAR",
@@ -162,6 +165,7 @@ def build_def_map_asof(df_defs: pd.DataFrame, ts: pd.Timestamp) -> dict:
     return dict(zip(keys, vals))
 
 
+
 # ==============================
 # API PULLS (NO BATCH FILES)
 # ==============================
@@ -207,10 +211,24 @@ def pull_cbbo_last_le_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
     out = {}
     for _, r in last_rows.iterrows():
         rs = str(r["symbol"])
-        bid = float(r.get("bid_px", 0) or 0)
-        ask = float(r.get("ask_px", 0) or 0)
-        out[rs] = (bid if bid > 0 else None, ask if ask > 0 else None)
+
+        # correct OPRA column names
+        bid = r.get("bid_px_00", None)
+        ask = r.get("ask_px_00", None)
+
+        # fallback safety (still _00)
+        if bid is None:
+            bid = r.get("bid_px_00", 0)
+        if ask is None:
+            ask = r.get("ask_px_00", 0)
+
+        bid = float(bid) if bid and bid > 0 else None
+        ask = float(ask) if ask and ask > 0 else None
+
+        out[rs] = (bid, ask)
+
     return out
+
 
 def pull_trades_volume_window_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
     """
@@ -247,9 +265,12 @@ def pull_trades_volume_window_many(raw_symbols: list[str], ts: pd.Timestamp) -> 
     g = df.groupby("symbol")["size"].sum()
     return {str(k): float(v) for k, v in g.items()}
 
+# ==============================
+# ✅ STATISTICS FIX (OPEN INTEREST)
+# ==============================
 def pull_oi_last_le_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
     """
-    raw_symbol -> open_interest from last stats row <= ts
+    raw_symbol -> open_interest from last OPEN_INTEREST stats row <= ts
     """
     if not raw_symbols:
         return {}
@@ -274,6 +295,14 @@ def pull_oi_last_le_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
     if df is None or df.empty:
         return {}
 
+    # keep only OPEN_INTEREST rows
+    if "stat_type" in df.columns:
+        df = df[df["stat_type"] == db.StatType.OPEN_INTEREST].copy()
+
+    # rename quantity -> open_interest
+    if "quantity" in df.columns and "open_interest" not in df.columns:
+        df = df.rename(columns={"quantity": "open_interest"})
+
     tcol = "ts_event" if "ts_event" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
     if tcol is None:
         return {}
@@ -292,6 +321,7 @@ def pull_oi_last_le_many(raw_symbols: list[str], ts: pd.Timestamp) -> dict:
         oi = r.get("open_interest", None)
         out[rs] = None if (oi is None or pd.isna(oi)) else int(oi)
     return out
+
 
 
 # ==============================

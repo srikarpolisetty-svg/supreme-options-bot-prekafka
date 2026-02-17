@@ -1,49 +1,112 @@
+import time
+import pathlib
+import operator
 import databento as db
-import datetime as dt
-import pytz
 from config import DATABENTO_API_KEY
 
 client = db.Historical(DATABENTO_API_KEY)
 
-now = dt.datetime.now(tz=pytz.UTC)
+START = "2024-01-02"
+END   = "2024-01-03"
 
-# Clamp `end` so it’s always <= available dataset range (avoids your error)
-end = now - dt.timedelta(minutes=10000)
-start = end - dt.timedelta(days=240)
- 
-symbol = "AAPL"
-today = end.date()
+BATCH_DIR = pathlib.Path("batch_downloads")
+POLL_S = 2.0
 
-# 1) Get a REAL raw_symbol from definition (no guessing)
-defs = client.timeseries.get_range(
+
+def batch_get_df(
+    dataset: str,
+    schema: str,
+    symbols,
+    start,
+    end,
+    *,
+    stype_in: str,
+    split_duration: str = "day",
+    poll_s: float = 2.0,
+):
+    """
+    Batch job -> wait -> download -> load .dbn.zst -> concat to df
+    """
+    if not symbols:
+        raise ValueError("symbols is empty")
+
+    job = client.batch.submit_job(
+        dataset=dataset,
+        start=start,
+        end=end,
+        symbols=symbols,
+        schema=schema,
+        split_duration=split_duration,
+        stype_in=stype_in,
+    )
+    job_id = job["id"]
+
+    while True:
+        done_ids = set(map(operator.itemgetter("id"), client.batch.list_jobs("done")))
+        if job_id in done_ids:
+            break
+        time.sleep(poll_s)
+
+    out_dir = BATCH_DIR / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = client.batch.download(job_id=job_id, output_dir=out_dir)
+
+    dfs = []
+    for f in sorted(files):
+        # `f` can be a Path, so cast to str before endswith
+        if str(f).endswith(".dbn.zst"):
+            store = db.DBNStore.from_file(f)
+            dfs.append(store.to_df())
+
+    if not dfs:
+        # empty result is still valid
+        import pandas as pd
+        return pd.DataFrame()
+
+    import pandas as pd
+    return pd.concat(dfs, ignore_index=True)
+
+
+# ----------------------------
+# 1) Definition (batch)
+# ----------------------------
+defs = batch_get_df(
     dataset="OPRA.PILLAR",
     schema="definition",
-    symbols=f"{symbol}.OPT",
+    symbols=["NVDA.OPT"],      # parent symbol (options root)
+    start=START,
+    end=END,
     stype_in="parent",
-    start=today,
-).to_df()
+    split_duration="day",
+    poll_s=POLL_S,
+)
 
-if defs.empty:
-    raise RuntimeError("No definition rows returned.")
+print("DEFINITION COLUMNS:", list(defs.columns))
+print(defs[["raw_symbol", "instrument_class", "expiration", "strike_price"]].head(10))
 
-raw_symbol = defs["raw_symbol"].iloc[0]
-print("RAW SYMBOL:", raw_symbol)
+raw_contract = defs["raw_symbol"].dropna().astype(str).iloc[0]
+print("\nUsing raw_symbol:", raw_contract)
 
-# 2) Pull statistics for that raw_symbol
-stats = client.timeseries.get_range(
+# ----------------------------
+# 2) Statistics (batch)
+# ----------------------------
+stats = batch_get_df(
     dataset="OPRA.PILLAR",
     schema="statistics",
-    symbols=[raw_symbol],
+    symbols=[raw_contract],     # contract-level
+    start=START,
+    end=END,
     stype_in="raw_symbol",
-    start=start,
-    end=end,
-).to_df()
+    split_duration="day",
+    poll_s=POLL_S,
+)
 
-print(stats.head())
-print(stats.columns)
-print("stat_type uniques:", sorted(stats["stat_type"].dropna().unique()))
+print("\nSTATS COLUMNS:", list(stats.columns))
 
-# 3) Extract open interest rows (stat_type == 9)
-oi = stats[stats["stat_type"] == 9].copy()
-print("OI rows:", len(oi))
-print(oi[["ts_event", "ts_ref", "quantity", "symbol"]].tail(10))
+# ----------------------------
+# 3) Filter OI
+# ----------------------------
+oi = stats[stats["stat_type"] == db.StatType.OPEN_INTEREST]
+print("\nOPEN INTEREST ROWS:")
+print(oi[["symbol", "quantity", "ts_event"]])

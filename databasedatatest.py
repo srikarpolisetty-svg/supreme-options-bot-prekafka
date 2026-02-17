@@ -22,19 +22,20 @@ print(symbols_df)
 exp_df = con.execute("""
 SELECT DISTINCT expiration_date
 FROM option_snapshots_raw
-WHERE symbol = 'AMD'
+WHERE symbol = 'AAPL'
 ORDER BY expiration_date
 """).df()
-print("\n=== AMD EXPIRATIONS ===")
+print("\n=== AAPL EXPIRATIONS ===")
 print(exp_df)
 
 sample_df = con.execute("""
 SELECT *
 FROM option_snapshots_raw
+WHERE symbol = 'AAPL'
 USING SAMPLE 50 ROWS
 """).df()
 
-print("\n=== SAMPLE ROWS (MULTI-SYMBOL) ===")
+print("\n=== SAMPLE ROWS (AAPL) ===")
 print(sample_df)
 
 con.close()
