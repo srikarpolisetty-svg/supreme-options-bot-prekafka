@@ -372,7 +372,6 @@ def batch_underlying_last_close(
 
 
 
-if symbol contains (-) , replace dash with a dot 
 
 
 
