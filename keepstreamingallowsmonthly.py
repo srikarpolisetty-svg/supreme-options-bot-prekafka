@@ -395,9 +395,10 @@ def build_raw_symbol_universe(
             schema="definition",
             symbols=f"{sym}.OPT",
             stype_in="parent",
-            start=today_utc,
+            start=today_utc - dt.timedelta(days=1),
             end=today_utc,
         ).to_df()
+
 
 
         if chain_df is None or chain_df.empty:
