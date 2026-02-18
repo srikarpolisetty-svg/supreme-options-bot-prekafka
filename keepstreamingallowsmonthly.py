@@ -370,8 +370,18 @@ def batch_underlying_last_close(
     return out
 
 
+
+
+if symbol contains (-) , replace dash with a dot 
+
+
+
+
+
+
 # -------------------------
 # STREAMER: 2) BUILD RAW_SYMBOL UNIVERSE + STRIKES6 ROWS (definition)
+# -------------------------
 # -------------------------
 def build_raw_symbol_universe(
     symbols: list[str],
@@ -390,16 +400,17 @@ def build_raw_symbol_universe(
         if px is None or px <= 0:
             continue
 
+        # Databento parent symbology fix (BF-B → BF.B)
+        parent_sym = sym.replace("-", ".")
+
         chain_df = hist.timeseries.get_range(
             dataset="OPRA.PILLAR",
             schema="definition",
-            symbols=f"{sym}.OPT",
+            symbols=f"{parent_sym}.OPT",
             stype_in="parent",
             start=today_utc - dt.timedelta(days=1),
             end=today_utc,
         ).to_df()
-
-
 
         if chain_df is None or chain_df.empty:
             continue
@@ -451,7 +462,12 @@ def build_raw_symbol_universe(
         )
 
         all_raw_symbols.extend(raws)
-        meta[sym] = {"exp": exp, "underlying_price": float(px), "strike_map": strike_map, "raws": raws}
+        meta[sym] = {
+            "exp": exp,
+            "underlying_price": float(px),
+            "strike_map": strike_map,
+            "raws": raws,
+        }
 
     seen = set()
     uniq = []
@@ -461,6 +477,7 @@ def build_raw_symbol_universe(
             uniq.append(r)
 
     return uniq, strike_rows, meta
+
 
 
 # -------------------------
