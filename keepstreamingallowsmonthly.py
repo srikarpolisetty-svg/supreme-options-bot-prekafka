@@ -396,7 +396,9 @@ def build_raw_symbol_universe(
             symbols=f"{sym}.OPT",
             stype_in="parent",
             start=today_utc,
+            end=today_utc,
         ).to_df()
+
 
         if chain_df is None or chain_df.empty:
             continue
@@ -586,9 +588,9 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
                 if raw:
                     ts_event = to_utc_naive(getattr(rec, "ts_event", None))
 
+                    # QUOTES (mbp-1)
                     bid = getattr(rec, "bid_px_00", None)
                     ask = getattr(rec, "ask_px_00", None)
-
                     if bid is not None or ask is not None:
                         bid_f = float(bid) if bid is not None and bid > 0 else None
                         ask_f = float(ask) if ask is not None and ask > 0 else None
@@ -602,18 +604,22 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
                             "spread": spread,
                             "spread_pct": spread_pct,
                         }
-                    else:
-                        size = getattr(rec, "size", None)
-                        if size is not None:
-                            try:
-                                sz = int(size)
-                            except Exception:
-                                sz = 0
-                            dq = vol_deques.get(raw)
-                            if dq is None:
-                                dq = deque()
-                                vol_deques[raw] = dq
-                            dq.append((now_sec, sz))
+
+                    # TRADES (volume) — use trade size fields (size or quantity)
+                    size = getattr(rec, "size", None)
+                    if size is None:
+                        size = getattr(rec, "quantity", None)
+                    if size is not None:
+                        try:
+                            sz = int(size)
+                        except Exception:
+                            sz = 0
+
+                        dq = vol_deques.get(raw)
+                        if dq is None:
+                            dq = deque()
+                            vol_deques[raw] = dq
+                        dq.append((now_sec, sz))
 
             cutoff = now_sec - VOL_WINDOW_SEC
             for raw, dq in list(vol_deques.items()):
@@ -647,7 +653,9 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
                     ]
                     con.executemany(upsert_vol, rows)
 
-                print(f"flush quotes={len(quote_latest)} vol={len(vol_latest)} subscribed={len(subscribed)}")
+                print(
+                    f"flush quotes={len(quote_latest)} vol={len(vol_latest)} subscribed={len(subscribed)}"
+                )
 
     except KeyboardInterrupt:
         print("Stopping (KeyboardInterrupt)...")
@@ -719,3 +727,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
