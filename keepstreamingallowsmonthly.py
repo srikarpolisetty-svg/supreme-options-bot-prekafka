@@ -399,8 +399,8 @@ def build_raw_symbol_universe(
         if px is None or px <= 0:
             continue
 
-        # Databento parent symbology fix (BF-B → BF.B)
-        parent_sym = sym.replace("-", ".")
+        # Databento parent symbology fix (remove '-' and '.' e.g. BF-B -> BFB)
+        parent_sym = sym.replace("-", "").replace(".", "")
 
         chain_df = hist.timeseries.get_range(
             dataset="OPRA.PILLAR",
@@ -476,6 +476,10 @@ def build_raw_symbol_universe(
             uniq.append(r)
 
     return uniq, strike_rows, meta
+
+
+
+
 
 
 
