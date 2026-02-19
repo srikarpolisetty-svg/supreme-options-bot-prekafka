@@ -15,13 +15,15 @@ df = con.execute("""
     WHERE symbol = ?
 """, ["AAPL"]).fetchdf()
 
+print(df)
+
 
 con = duckdb.connect(DB_PATH)
 
-df = con.execute("""
+df1 = con.execute("""
     SELECT DISTINCT symbol
     FROM definition_cache
     ORDER BY symbol
 """).fetchdf()
 
-print(df)
+print(df1)
