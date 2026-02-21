@@ -3,7 +3,6 @@ import duckdb
 
 
 
-
 DB_PATH = "definitioncache.duckdb"
 con = duckdb.connect(DB_PATH)
 
@@ -12,18 +11,17 @@ SELECT DISTINCT symbol
 FROM definition_cache
 """).fetchdf()["symbol"].tolist()
 
-for symbol in symbols 
+print(len(symbols))
 
-
+for symbol in symbols:
     df = con.execute("""
     SELECT strike_price
     FROM definition_cache
     WHERE symbol = ?
     """, [symbol]).fetchdf()
 
-strikes = df["strike_price"].tolist()
-
-print(strikes)
+    strikes = df["strike_price"].tolist()
+    print(strikes)
 
 
 def build_raw_symbol_universe(
