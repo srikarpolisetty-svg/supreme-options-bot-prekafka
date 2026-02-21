@@ -19,7 +19,7 @@ df = con.execute("""
     WHERE symbol = ?
 """, ["AAPL"]).fetchdf()
 
-print(df)
+print(df.columns.tolist())
 
 
 con = duckdb.connect(DB_PATH)
