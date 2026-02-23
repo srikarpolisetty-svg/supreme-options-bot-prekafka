@@ -21,13 +21,3 @@ df = con.execute("""
 
 print(df.columns.tolist())
 
-
-con = duckdb.connect(DB_PATH)
-
-df1 = con.execute("""
-    SELECT DISTINCT symbol
-    FROM definition_cache
-    ORDER BY symbol
-""").fetchdf()
-
-print(df1)
