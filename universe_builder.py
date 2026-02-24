@@ -16,7 +16,7 @@ print(len(symbols))
 
 for symbol in symbols:
     df = con.execute("""
-    SELECT raw_symbol 
+    SELECT raw_symbol, expiration 
     FROM definition_cache
     WHERE symbol = ?
     """, [symbol]).fetchdf()
