@@ -194,7 +194,7 @@ def load_raw_universe_cache(path: str) -> list[str]:
 # -------------------------
 def subscribe_raws(live: db.Live, raws: list[str]):
     for batch in chunks(raws, SUB_BATCH_SIZE):
-        live.subscribe(dataset="OPRA.PILLAR", schema="mbp-1", symbols=batch, stype_in="raw_symbol")
+        live.subscribe(dataset="OPRA.PILLAR", schema="cbbo-1m", symbols=batch, stype_in="raw_symbol")
         live.subscribe(dataset="OPRA.PILLAR", schema="trades", symbols=batch, stype_in="raw_symbol")
         time.sleep(SUB_SLEEP_SEC)
 
