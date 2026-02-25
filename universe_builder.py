@@ -114,12 +114,16 @@ def batch_underlying_last_close(
 ) -> dict[str, float]:
     out: dict[str, float] = {}
 
+    # --- MINIMAL CHANGE: widen window by ±5 minutes ---
+    start_adj = start - dt.timedelta(minutes=5)
+    end_adj = end + dt.timedelta(minutes=5)
+
     for batch in chunks(symbols, BATCH_SIZE_YF):
         try:
             df = yf.download(
                 tickers=batch,
-                start=start,
-                end=end,
+                start=start_adj,
+                end=end_adj,
                 interval=INTERVAL_YF,
                 group_by="ticker",
                 progress=False,
