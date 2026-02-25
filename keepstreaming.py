@@ -228,6 +228,10 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
 
     live = db.Live(key=DATABENTO_API_KEY)
 
+    # --- CHANGE: use callback queue (Databento Live has no next_record) ---
+    record_q = deque(maxlen=200_000)
+    live.add_callback(lambda rec: record_q.append(rec))
+
     subscribed: set[str] = set()
     last_refresh = 0.0
     last_flush = time.time()
@@ -267,7 +271,8 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
                     else:
                         print("No new raws to add from cache.")
 
-            rec = live.next_record(timeout=1.0)
+            # --- CHANGE: pop from callback queue instead of live.next_record() ---
+            rec = record_q.popleft() if record_q else None
             now_sec = time.time()
 
             if rec is not None:
