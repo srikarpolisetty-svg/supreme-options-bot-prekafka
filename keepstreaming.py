@@ -36,7 +36,7 @@ FLUSH_EVERY_SEC = 1.0
 # universe refresh cadence (reload raw_symbol cache file, subscribe new)
 REFRESH_SEC = 10 * 60
 
-RESTART_HOUR_UTC = 21
+RESTART_HOUR_UTC = 24
 RESTART_MIN_UTC = 10
 
 DUCKDB_LIVE_PATH = "live_state.duckdb"
