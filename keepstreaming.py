@@ -18,38 +18,31 @@ import pytz
 from collections import deque
 
 import pandas as pd
-import yfinance as yf
 import databento as db
 import duckdb
 
-from databasefunctions import get_sp500_symbols
 from config import DATABENTO_API_KEY
 
 
 # -------------------------
 # CONFIG
 # -------------------------
-BATCH_SIZE_YF = 40
-SLEEP_SEC_YF = 5
-INTERVAL_YF = "15m"
-
-RESTART_HOUR_UTC = 21
-RESTART_MIN_UTC = 10
-
 SUB_BATCH_SIZE = 200
 SUB_SLEEP_SEC = 0.25
 
 VOL_WINDOW_SEC = 10 * 60
 FLUSH_EVERY_SEC = 1.0
 
-# latest 6-strike set refresh cadence
+# universe refresh cadence (reload raw_symbol cache file, subscribe new)
 REFRESH_SEC = 10 * 60
 
-# daily OI fetch (only once per day per raw_symbol)
-OI_FETCH_BATCH = 200
-OI_FETCH_SLEEP_SEC = 0.25
+RESTART_HOUR_UTC = 21
+RESTART_MIN_UTC = 10
 
 DUCKDB_LIVE_PATH = "live_state.duckdb"
+
+# raw_symbol universe cache written by universe_builder (newline-delimited)
+RAW_UNIVERSE_CACHE_PATH = "state/raw_universe_cache.txt"
 
 # snapshot freshness gates (used by snapshot mode; harmless to keep here)
 STRIKES_MAX_AGE_MIN = 20
@@ -165,39 +158,6 @@ def to_utc_naive(ts) -> datetime.datetime | None:
         return None
 
 
-def get_friday_within_4_days(expirations: list[str], today_utc: datetime.date) -> str | None:
-    for exp in sorted(expirations):
-        d = datetime.datetime.strptime(exp, "%Y%m%d").date()
-        if d.weekday() == 4 and 0 <= (d - today_utc).days <= 4 and not (15 <= d.day <= 21):
-            return exp
-    return None
-
-
-def closest_strike(target: float, strikes: list[float]) -> float:
-    return float(min(strikes, key=lambda s: abs(float(s) - float(target))))
-
-
-def pick_strikes(underlying_price: float, strikes: list[float]) -> dict:
-    atm = underlying_price
-    return {
-        "ATM": closest_strike(atm, strikes),
-        "C1": closest_strike(atm * 1.015, strikes),
-        "P1": closest_strike(atm * 0.985, strikes),
-        "C2": closest_strike(atm * 1.035, strikes),
-        "P2": closest_strike(atm * 0.965, strikes),
-    }
-
-
-def pick_raw_symbol(sub: pd.DataFrame, strike: float, cp: str) -> str | None:
-    tmp = sub[
-        (sub["strike_price"].astype(float) == float(strike))
-        & (sub["instrument_class"] == cp)
-    ]["raw_symbol"]
-    if tmp.empty:
-        return None
-    return tmp.iloc[0]
-
-
 def compute_quote_fields(bid: float | None, ask: float | None):
     if bid is not None and ask is not None and bid > 0 and ask > 0:
         mid = (bid + ask) / 2.0
@@ -207,256 +167,26 @@ def compute_quote_fields(bid: float | None, ask: float | None):
     return None, None, None
 
 
-# -------------------------
-# OI HELPERS (daily, once per raw_symbol per day)
-# -------------------------
-def oi_asof_date_utc() -> datetime.date:
-    # OI is end-of-day, so "as of yesterday" in UTC
-    return dt.datetime.now(tz=pytz.UTC).date() - dt.timedelta(days=1)
-
-
-def _df_symbol_col(df: pd.DataFrame) -> str | None:
-    for c in ("raw_symbol", "symbol"):
-        if c in df.columns:
-            return c
-    return None
-
-
-def fetch_open_interest_batch(
-    hist: db.Historical,
-    raw_symbols: list[str],
-    asof_date: datetime.date,
-) -> dict[str, int | None]:
+def load_raw_universe_cache(path: str) -> list[str]:
     """
-    raw_symbol -> open_interest (or None).
-    Includes missing raws as None (so we can upsert NULL and not retry until tomorrow).
+    Reads newline-delimited raw_symbol universe written atomically by universe_builder.
+    Returns [] if missing/empty.
     """
-    out: dict[str, int | None] = {r: None for r in raw_symbols}
-
-    df = hist.timeseries.get_range(
-        dataset="OPRA.PILLAR",
-        schema="statistics",
-        symbols=raw_symbols,
-        stype_in="raw_symbol",
-        start=asof_date,
-        end=asof_date,
-    ).to_df()
-
-    if df is None or df.empty:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raws = [ln.strip() for ln in f if ln.strip()]
+        # de-dupe preserving order
+        seen = set()
+        out = []
+        for r in raws:
+            if r not in seen:
+                seen.add(r)
+                out.append(r)
         return out
-
-    if "stat_type" in df.columns:
-        df = df[df["stat_type"] == db.StatType.OPEN_INTEREST]
-    if df.empty:
-        return out
-
-    sym_col = _df_symbol_col(df)
-    if sym_col is None or "quantity" not in df.columns:
-        return out
-
-    if "ts_event" in df.columns:
-        df = df.sort_values("ts_event")
-
-    last = df.groupby(sym_col, as_index=False).tail(1)
-
-    for _, row in last.iterrows():
-        raw = row.get(sym_col)
-        qty = row.get("quantity", None)
-        try:
-            if raw is not None and pd.notna(qty):
-                out[str(raw)] = int(qty)
-        except Exception:
-            pass
-
-    return out
-
-
-def update_daily_oi_if_needed(
-    con: duckdb.DuckDBPyConnection,
-    hist: db.Historical,
-    raw_symbols: list[str],
-) -> int:
-    """
-    Ensures OI exists for each raw_symbol for today's as-of date.
-    Only fetches for raws missing that oi_date.
-    Writes NULL OI rows when API returns nothing so we don't retry until tomorrow.
-    """
-    if not raw_symbols:
-        return 0
-
-    asof = oi_asof_date_utc()
-
-    existing_rows = con.execute(
-        "SELECT raw_symbol FROM live_oi_latest WHERE oi_date = ?",
-        [asof],
-    ).fetchall()
-    existing = {r[0] for r in existing_rows} if existing_rows else set()
-
-    missing = [r for r in raw_symbols if r not in existing]
-    if not missing:
-        return 0
-
-    upsert_oi = """
-    INSERT INTO live_oi_latest (raw_symbol, oi_date, ts_oi, open_interest)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(raw_symbol) DO UPDATE SET
-      oi_date=excluded.oi_date,
-      ts_oi=excluded.ts_oi,
-      open_interest=excluded.open_interest;
-    """
-
-    total_upserted = 0
-    for batch in chunks(missing, OI_FETCH_BATCH):
-        oi_map = fetch_open_interest_batch(hist, batch, asof_date=asof)
-        ts_oi = utc_now_naive()
-        rows = [(raw, asof, ts_oi, oi_map.get(raw)) for raw in batch]
-        con.executemany(upsert_oi, rows)
-        total_upserted += len(rows)
-        time.sleep(OI_FETCH_SLEEP_SEC)
-
-    return total_upserted
-
-
-# -------------------------
-# STREAMER: 1) BATCH UNDERLYING PRICES (yfinance)
-# -------------------------
-def batch_underlying_last_close(
-    symbols: list[str],
-    start: dt.datetime,
-    end: dt.datetime,
-) -> dict[str, float]:
-    out: dict[str, float] = {}
-
-    for batch in chunks(symbols, BATCH_SIZE_YF):
-        try:
-            df = yf.download(
-                tickers=batch,
-                start=start,
-                end=end,
-                interval=INTERVAL_YF,
-                group_by="ticker",
-                progress=False,
-                auto_adjust=False,
-            )
-        except Exception:
-            time.sleep(15)
-            continue
-
-        if df is None or df.empty:
-            time.sleep(SLEEP_SEC_YF)
-            continue
-
-        close = None
-        try:
-            close = df.xs("Close", axis=1, level=1)
-        except Exception:
-            try:
-                close = df.xs("Close", axis=1, level=0)
-            except Exception:
-                time.sleep(SLEEP_SEC_YF)
-                continue
-
-        for sym in batch:
-            if close is None or sym not in close.columns:
-                continue
-            s = close[sym].dropna()
-            if len(s) == 0:
-                continue
-            out[sym] = float(s.iloc[-1])
-
-        time.sleep(SLEEP_SEC_YF)
-
-    return out
-
-
-# -------------------------
-# STREAMER: 2) BUILD RAW_SYMBOL UNIVERSE + STRIKES6 ROWS (definition)
-# -------------------------
-def build_raw_symbol_universe(
-    symbols: list[str],
-    underlying_px: dict[str, float],
-) -> tuple[list[str], list[tuple], dict[str, dict]]:
-    hist = db.Historical(DATABENTO_API_KEY)
-    today_utc = dt.datetime.now(tz=pytz.UTC).date()
-    ts_refresh = utc_now_naive()
-
-    all_raw_symbols: list[str] = []
-    strike_rows: list[tuple] = []
-    meta: dict[str, dict] = {}
-
-    for sym in symbols:
-        px = underlying_px.get(sym)
-        if px is None or px <= 0:
-            continue
-
-        chain_df = hist.timeseries.get_range(
-            dataset="OPRA.PILLAR",
-            schema="definition",
-            symbols=f"{sym}.OPT",
-            stype_in="parent",
-            start=today_utc,
-        ).to_df()
-
-        if chain_df is None or chain_df.empty:
-            continue
-
-        chain_df["exp_yyyymmdd"] = chain_df["expiration"].dt.strftime("%Y%m%d")
-        expirations = sorted(chain_df["exp_yyyymmdd"].unique())
-        exp = get_friday_within_4_days(expirations, today_utc)
-        if exp is None:
-            continue
-
-        sub = chain_df[chain_df["exp_yyyymmdd"] == exp]
-        if sub.empty:
-            continue
-
-        strikes = sorted(sub["strike_price"].astype(float).unique())
-        if not strikes:
-            continue
-
-        strike_map = pick_strikes(px, strikes)
-
-        atm = strike_map["ATM"]
-        c1 = strike_map["C1"]
-        p1 = strike_map["P1"]
-        c2 = strike_map["C2"]
-        p2 = strike_map["P2"]
-
-        raw_atm_c = pick_raw_symbol(sub, atm, "C")
-        raw_atm_p = pick_raw_symbol(sub, atm, "P")
-        raw_c1 = pick_raw_symbol(sub, c1, "C")
-        raw_p1 = pick_raw_symbol(sub, p1, "P")
-        raw_c2 = pick_raw_symbol(sub, c2, "C")
-        raw_p2 = pick_raw_symbol(sub, p2, "P")
-
-        raws = [raw_atm_c, raw_atm_p, raw_c1, raw_p1, raw_c2, raw_p2]
-        if any(x is None for x in raws):
-            continue
-
-        exp_date = datetime.datetime.strptime(exp, "%Y%m%d").date()
-
-        strike_rows.extend(
-            [
-                (sym, "ATM", "C", exp, exp_date, float(atm), raw_atm_c, float(px), ts_refresh),
-                (sym, "ATM", "P", exp, exp_date, float(atm), raw_atm_p, float(px), ts_refresh),
-                (sym, "C1", "C", exp, exp_date, float(c1), raw_c1, float(px), ts_refresh),
-                (sym, "P1", "P", exp, exp_date, float(p1), raw_p1, float(px), ts_refresh),
-                (sym, "C2", "C", exp, exp_date, float(c2), raw_c2, float(px), ts_refresh),
-                (sym, "P2", "P", exp, exp_date, float(p2), raw_p2, float(px), ts_refresh),
-            ]
-        )
-
-        all_raw_symbols.extend(raws)
-        meta[sym] = {"exp": exp, "underlying_price": float(px), "strike_map": strike_map, "raws": raws}
-
-    seen = set()
-    uniq = []
-    for r in all_raw_symbols:
-        if r not in seen:
-            seen.add(r)
-            uniq.append(r)
-
-    return uniq, strike_rows, meta
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
 
 
 # -------------------------
@@ -475,9 +205,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
     vol_latest: dict[str, dict] = {}
 
     con = duckdb.connect(DUCKDB_LIVE_PATH)
-
-    # one Historical client reused (for daily OI only)
-    hist = db.Historical(DATABENTO_API_KEY)
 
     upsert_quote = """
     INSERT INTO live_quotes_latest (raw_symbol, ts_event, bid, ask, mid, spread, spread_pct)
@@ -499,22 +226,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
       vol10m=excluded.vol10m;
     """
 
-    upsert_strikes6 = """
-    INSERT INTO live_strikes6_latest (
-      parent_symbol, label, instrument_class,
-      exp_yyyymmdd, expiration_date, strike_price,
-      raw_symbol, underlying_price, ts_refresh
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(parent_symbol, label, instrument_class) DO UPDATE SET
-      exp_yyyymmdd=excluded.exp_yyyymmdd,
-      expiration_date=excluded.expiration_date,
-      strike_price=excluded.strike_price,
-      raw_symbol=excluded.raw_symbol,
-      underlying_price=excluded.underlying_price,
-      ts_refresh=excluded.ts_refresh;
-    """
-
     live = db.Live(key=DATABENTO_API_KEY)
 
     subscribed: set[str] = set()
@@ -522,13 +233,11 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
     last_flush = time.time()
 
     print("Subscribing initial raw_symbols:", len(initial_raw_symbols))
-    subscribe_raws(live, initial_raw_symbols)
-    subscribed.update(initial_raw_symbols)
-
-    # initial daily OI upsert for the starting universe (only missing)
-    n0 = update_daily_oi_if_needed(con, hist, list(subscribed))
-    if n0:
-        print(f"Initial OI upserts: {n0} (as-of {oi_asof_date_utc()})")
+    if initial_raw_symbols:
+        subscribe_raws(live, initial_raw_symbols)
+        subscribed.update(initial_raw_symbols)
+    else:
+        print(f"WARNING: initial_raw_symbols empty (cache={RAW_UNIVERSE_CACHE_PATH}).")
 
     live.start()
     print("Live streaming started. Ctrl+C to stop.")
@@ -545,37 +254,18 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
 
             if (time.time() - last_refresh) >= REFRESH_SEC:
                 last_refresh = time.time()
-                print("Refreshing strikes6 universe...")
 
-                now = dt.datetime.now(tz=pytz.UTC)
-                safe_end = now - dt.timedelta(minutes=10)
-                safe_start = safe_end - dt.timedelta(minutes=180)
-
-                symbols = sorted(get_sp500_symbols())
-                underlying_px = batch_underlying_last_close(symbols, start=safe_start, end=safe_end)
-                desired_raws, strike_rows, _meta = build_raw_symbol_universe(symbols, underlying_px)
-
-                if strike_rows:
-                    con.executemany(upsert_strikes6, strike_rows)
-                    print(f"Upserted strikes6 rows: {len(strike_rows)}")
-
-                # daily OI: only fetch for raws missing today's as-of date
-                oi_upserts = update_daily_oi_if_needed(con, hist, desired_raws)
-                if oi_upserts:
-                    print(f"Upserted OI rows: {oi_upserts} (as-of {oi_asof_date_utc()})")
-
-                to_add = [r for r in desired_raws if r not in subscribed]
-                if to_add:
-                    print(f"Subscribing NEW raws: {len(to_add)}")
-                    subscribe_raws(live, to_add)
-                    subscribed.update(to_add)
-
-                    # for newly added raws, ensure OI is present for today (only missing)
-                    oi_new = update_daily_oi_if_needed(con, hist, to_add)
-                    if oi_new:
-                        print(f"Upserted NEW OI rows: {oi_new} (as-of {oi_asof_date_utc()})")
+                desired_raws = load_raw_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+                if not desired_raws:
+                    print(f"Universe cache empty/missing: {RAW_UNIVERSE_CACHE_PATH}")
                 else:
-                    print("No new raws to add.")
+                    to_add = [r for r in desired_raws if r not in subscribed]
+                    if to_add:
+                        print(f"Subscribing NEW raws from cache: {len(to_add)}")
+                        subscribe_raws(live, to_add)
+                        subscribed.update(to_add)
+                    else:
+                        print("No new raws to add from cache.")
 
             rec = live.next_record(timeout=1.0)
             now_sec = time.time()
@@ -676,42 +366,8 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
 def main():
     init_live_duckdb()
 
-    now = dt.datetime.now(tz=pytz.UTC)
-    safe_end = now - dt.timedelta(minutes=10)
-    safe_start = safe_end - dt.timedelta(minutes=180)
-
-    symbols = sorted(get_sp500_symbols())
-    print("Total symbols:", len(symbols))
-
-    print("Batch fetching underlying prices (yfinance)...")
-    underlying_px = batch_underlying_last_close(symbols, start=safe_start, end=safe_end)
-    print("Underlying prices found:", len(underlying_px))
-
-    print("Building raw_symbol universe (Databento definition)...")
-    raw_symbols, strike_rows, meta = build_raw_symbol_universe(symbols, underlying_px)
-    print("Good underlyings:", len(meta))
-    print("Total raw_symbols:", len(raw_symbols))
-
-    if strike_rows:
-        con0 = duckdb.connect(DUCKDB_LIVE_PATH)
-        upsert_strikes6 = """
-        INSERT INTO live_strikes6_latest (
-          parent_symbol, label, instrument_class,
-          exp_yyyymmdd, expiration_date, strike_price,
-          raw_symbol, underlying_price, ts_refresh
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(parent_symbol, label, instrument_class) DO UPDATE SET
-          exp_yyyymmdd=excluded.exp_yyyymmdd,
-          expiration_date=excluded.expiration_date,
-          strike_price=excluded.strike_price,
-          raw_symbol=excluded.raw_symbol,
-          underlying_price=excluded.underlying_price,
-          ts_refresh=excluded.ts_refresh;
-        """
-        con0.executemany(upsert_strikes6, strike_rows)
-        con0.close()
-        print(f"Initial upsert strikes6 rows: {len(strike_rows)}")
+    raw_symbols = load_raw_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+    print("Initial raw_symbols from cache:", len(raw_symbols))
 
     stream_to_duckdb_latest(raw_symbols)
 
