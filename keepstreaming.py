@@ -167,26 +167,52 @@ def compute_quote_fields(bid: float | None, ask: float | None):
     return None, None, None
 
 
-def load_raw_universe_cache(path: str) -> list[str]:
+def load_universe_cache(path: str):
     """
-    Reads newline-delimited raw_symbol universe written atomically by universe_builder.
-    Returns [] if missing/empty.
+    New file format per line:
+      parent_symbol raw_symbol underlying_price
+
+    Returns:
+      raws: list[str] for subscribing
+      strike_rows: list[tuple] for live_strikes6_latest upsert (label/cp left NULL)
     """
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raws = [ln.strip() for ln in f if ln.strip()]
-        # de-dupe preserving order
+        raws = []
+        strike_rows = []
         seen = set()
-        out = []
-        for r in raws:
-            if r not in seen:
-                seen.add(r)
-                out.append(r)
-        return out
+
+        ts_refresh = utc_now_naive()
+
+        with open(path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                if len(parts) < 3:
+                    continue  # skip bad lines
+
+                parent = parts[0]
+                raw = parts[1]
+                try:
+                    px = float(parts[2])
+                except Exception:
+                    px = None
+
+                if raw not in seen:
+                    seen.add(raw)
+                    raws.append(raw)
+
+                # minimal: store mapping + underlying_price; leave label/cp unknown
+                strike_rows.append(
+                    (parent, "UNIVERSE", "U", None, None, None, raw, px, ts_refresh)
+                )
+
+        return raws, strike_rows
     except FileNotFoundError:
-        return []
+        return [], []
     except Exception:
-        return []
+        return [], []
 
 
 # -------------------------
@@ -199,7 +225,7 @@ def subscribe_raws(live: db.Live, raws: list[str]):
         time.sleep(SUB_SLEEP_SEC)
 
 
-def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
+def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows: list[tuple]):
     quote_latest: dict[str, dict] = {}
     vol_deques: dict[str, deque] = {}
     vol_latest: dict[str, dict] = {}
@@ -225,6 +251,22 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
       ts_calc=excluded.ts_calc,
       vol10m=excluded.vol10m;
     """
+
+    upsert_strikes6 = """
+    INSERT INTO live_strikes6_latest (
+      parent_symbol, label, instrument_class,
+      exp_yyyymmdd, expiration_date, strike_price,
+      raw_symbol, underlying_price, ts_refresh
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(parent_symbol, label, instrument_class) DO UPDATE SET
+      raw_symbol=excluded.raw_symbol,
+      underlying_price=excluded.underlying_price,
+      ts_refresh=excluded.ts_refresh;
+    """
+
+    if initial_strike_rows:
+        con.executemany(upsert_strikes6, initial_strike_rows)
 
     live = db.Live(key=DATABENTO_API_KEY)
 
@@ -259,7 +301,10 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
             if (time.time() - last_refresh) >= REFRESH_SEC:
                 last_refresh = time.time()
 
-                desired_raws = load_raw_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+                desired_raws, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+                if strike_rows:
+                    con.executemany(upsert_strikes6, strike_rows)
+
                 if not desired_raws:
                     print(f"Universe cache empty/missing: {RAW_UNIVERSE_CACHE_PATH}")
                 else:
@@ -371,10 +416,10 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
 def main():
     init_live_duckdb()
 
-    raw_symbols = load_raw_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+    raw_symbols, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
     print("Initial raw_symbols from cache:", len(raw_symbols))
 
-    stream_to_duckdb_latest(raw_symbols)
+    stream_to_duckdb_latest(raw_symbols, strike_rows)
 
 
 if __name__ == "__main__":

@@ -101,10 +101,19 @@ def write_universe_cache_with_underlying(
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
         for row in strike_rows:
-            parent_symbol = row[0]
+            parent_symbol = row[0]      # sym
+            label = row[1]              # ATM / C1 / P1 / C2 / P2
+            instrument_class = row[2]   # C / P
+            exp_yyyymmdd = row[3]       # "YYYYMMDD"
+            strike_price = row[5]       # float
             raw_symbol = row[6]
             underlying_price = row[7]
-            f.write(f"{parent_symbol} {raw_symbol} {underlying_price}\n")
+            ts_refresh = row[8]
+
+            f.write(
+                f"{parent_symbol} {label} {instrument_class} {exp_yyyymmdd} "
+                f"{strike_price} {raw_symbol} {underlying_price} {ts_refresh}\n"
+            )
 
     os.replace(tmp_path, path)
 
