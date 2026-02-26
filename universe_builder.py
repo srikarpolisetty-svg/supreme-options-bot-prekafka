@@ -92,16 +92,21 @@ def pick_raw_symbol(sub: pd.DataFrame, strike: float, cp: str) -> str | None:
     return str(tmp.iloc[0])
 
 
-def write_universe_cache(desired_raws: list[str], path: str = UNIVERSE_CACHE_PATH) -> None:
-    # Ensure parent directory exists
+def write_universe_cache_with_underlying(
+    strike_rows: list[tuple],
+    path: str = UNIVERSE_CACHE_PATH,
+) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
-        for r in desired_raws:
-            f.write(r + "\n")
+        for row in strike_rows:
+            parent_symbol = row[0]
+            raw_symbol = row[6]
+            underlying_price = row[7]
+            f.write(f"{parent_symbol} {raw_symbol} {underlying_price}\n")
 
-    os.replace(tmp_path, path)  # atomic swap on Linux
+    os.replace(tmp_path, path)
 
 
 # -------------------------
@@ -293,7 +298,7 @@ def main():
     print("Total strike_rows:", len(strike_rows))
 
     # NEW: write raw universe cache for streamer
-    write_universe_cache(raw_symbols)
+    write_universe_cache_with_underlying(strike_rows)
     print("Wrote universe cache:", UNIVERSE_CACHE_PATH)
 
     # NOTE: strike_rows/meta are still returned for any other use (e.g., live_strikes6_latest upsert elsewhere)
