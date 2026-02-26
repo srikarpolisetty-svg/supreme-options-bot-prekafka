@@ -18,7 +18,7 @@ STRIKES_MAX_AGE_MIN = 10
 # -------------------------
 def get_sixpack_from_db(con, symbol: str) -> pd.DataFrame:
     """
-    Returns 6 rows for a symbol from live_strikes6_latest.
+    Returns 6 rows for a symbol from live_contract_latest.
     Expected labels: ATM, C1, P1, C2, P2 with instrument_class C/P as appropriate.
     """
     return con.execute(
@@ -33,23 +33,21 @@ def get_sixpack_from_db(con, symbol: str) -> pd.DataFrame:
             raw_symbol,
             underlying_price,
             ts_refresh
-        FROM live_strikes6_latest
+        FROM live_contract_latest
         WHERE parent_symbol = ?
+          AND label IN ('ATM','C1','P1','C2','P2')
+          AND instrument_class IN ('C','P')
         ORDER BY label, instrument_class
         """,
         [symbol],
     ).fetchdf()
 
 
-
-
-
-
 def get_quote_from_db(con, raw_symbol: str) -> dict:
     row = con.execute(
         """
         SELECT bid, ask, mid, spread, spread_pct
-        FROM live_quotes_latest
+        FROM live_contract_latest
         WHERE raw_symbol = ?
         """,
         [raw_symbol],
@@ -74,7 +72,7 @@ def get_vol10m_from_db(con, raw_symbol: str) -> int:
     row = con.execute(
         """
         SELECT vol10m
-        FROM live_vol10m_latest
+        FROM live_contract_latest
         WHERE raw_symbol = ?
         """,
         [raw_symbol],
@@ -84,12 +82,12 @@ def get_vol10m_from_db(con, raw_symbol: str) -> int:
 
 def get_oi_from_db(con, raw_symbol: str) -> int | None:
     """
-    Daily OI populated by streamer into live_oi_latest.
+    Daily OI populated by streamer into live_contract_latest (if/when enabled).
     """
     row = con.execute(
         """
         SELECT open_interest
-        FROM live_oi_latest
+        FROM live_contract_latest
         WHERE raw_symbol = ?
         """,
         [raw_symbol],
@@ -269,6 +267,10 @@ def run_db_option_snapshot_to_parquet(
 
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     snapshot_id = f"{symbol}_{timestamp}"
+
+    # (rest of your parquet / z-score / exec code continues unchanged)
+
+    # ... (everything below remains exactly the same as you posted)
 
     # (rest of your parquet / z-score / exec code continues unchanged)
 

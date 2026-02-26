@@ -5,8 +5,7 @@
 #
 # Streamer is kept lean:
 #   - NO z-scores / NO parquet / NO IV / NO OI cache / NO dbfunctions except get_sp500_symbols
-#   - Only maintains: live_quotes_latest, live_vol10m_latest, live_strikes6_latest, live_oi_latest,
-#                     live_sixpack_ready view
+#   - Maintains ONE table: live_contract_latest (metadata + quote + rolling vol + optional OI)
 
 from __future__ import annotations
 
@@ -49,88 +48,45 @@ STRIKES_MAX_AGE_MIN = 20
 
 
 # -------------------------
-# DUCKDB (LIVE) TABLES
+# DUCKDB (LIVE) TABLE (SINGLE)
 # -------------------------
-DDL_LIVE_QUOTES = """
-CREATE TABLE IF NOT EXISTS live_quotes_latest (
-    raw_symbol TEXT PRIMARY KEY,
-    ts_event   TIMESTAMP,
+DDL_LIVE_CONTRACT_LATEST = """
+CREATE TABLE IF NOT EXISTS live_contract_latest (
+    raw_symbol       TEXT PRIMARY KEY,
+
+    -- contract identity / routing (from universe cache)
+    parent_symbol    TEXT,
+    label            TEXT,         -- ATM, C1, P1, C2, P2
+    instrument_class TEXT,         -- C or P
+    exp_yyyymmdd     TEXT,
+    expiration_date  DATE,
+    strike_price     DOUBLE,
+    underlying_price DOUBLE,
+    ts_refresh       TIMESTAMP,
+
+    -- latest quote (from cbbo-1m)
+    ts_quote   TIMESTAMP,
     bid        DOUBLE,
     ask        DOUBLE,
     mid        DOUBLE,
     spread     DOUBLE,
-    spread_pct DOUBLE
-);
-"""
+    spread_pct DOUBLE,
 
-DDL_LIVE_VOL = """
-CREATE TABLE IF NOT EXISTS live_vol10m_latest (
-    raw_symbol TEXT PRIMARY KEY,
-    ts_calc    TIMESTAMP,
-    vol10m     BIGINT
-);
-"""
+    -- rolling volume (from trades)
+    ts_vol     TIMESTAMP,
+    vol10m     BIGINT,
 
-DDL_LIVE_STRIKES6 = """
-CREATE TABLE IF NOT EXISTS live_strikes6_latest (
-    parent_symbol    TEXT,
-    label            TEXT,       -- ATM, C1, P1, C2, P2
-    instrument_class TEXT,       -- C or P
-    exp_yyyymmdd     TEXT,
-    expiration_date  DATE,
-    strike_price     DOUBLE,
-    raw_symbol       TEXT,
-    underlying_price DOUBLE,
-    ts_refresh       TIMESTAMP,
-    PRIMARY KEY(parent_symbol, label, instrument_class)
-);
-"""
-
-DDL_LIVE_OI = """
-CREATE TABLE IF NOT EXISTS live_oi_latest (
-    raw_symbol     TEXT PRIMARY KEY,
-    oi_date        DATE,        -- as-of date for OI (typically yesterday UTC)
+    -- open interest (optional; if/when you stream it)
+    oi_date        DATE,
     ts_oi          TIMESTAMP,
     open_interest  BIGINT
 );
 """
 
-DDL_VIEW_SIXPACK_READY = """
-CREATE VIEW IF NOT EXISTS live_sixpack_ready AS
-SELECT
-  s.parent_symbol AS symbol,
-  s.label,
-  s.instrument_class,
-  s.exp_yyyymmdd,
-  s.expiration_date,
-  s.strike_price,
-  s.raw_symbol,
-  s.underlying_price,
-  s.ts_refresh,
-
-  q.ts_event,
-  q.bid, q.ask, q.mid, q.spread, q.spread_pct,
-
-  v.ts_calc,
-  v.vol10m,
-
-  o.oi_date,
-  o.ts_oi,
-  o.open_interest
-FROM live_strikes6_latest s
-LEFT JOIN live_quotes_latest q ON q.raw_symbol = s.raw_symbol
-LEFT JOIN live_vol10m_latest v ON v.raw_symbol = s.raw_symbol
-LEFT JOIN live_oi_latest o ON o.raw_symbol = s.raw_symbol;
-"""
-
 
 def init_live_duckdb():
     con = duckdb.connect(DUCKDB_LIVE_PATH)
-    con.execute(DDL_LIVE_QUOTES)
-    con.execute(DDL_LIVE_VOL)
-    con.execute(DDL_LIVE_STRIKES6)
-    con.execute(DDL_LIVE_OI)
-    con.execute(DDL_VIEW_SIXPACK_READY)
+    con.execute(DDL_LIVE_CONTRACT_LATEST)
     con.close()
 
 
@@ -169,46 +125,88 @@ def compute_quote_fields(bid: float | None, ask: float | None):
 
 def load_universe_cache(path: str):
     """
-    New file format per line:
-      parent_symbol raw_symbol underlying_price
+    Expected per line (space-separated):
+      parent_symbol label instrument_class exp_yyyymmdd strike_price root_symbol raw_symbol underlying_price ts_refresh...
 
-    Returns:
-      raws: list[str] for subscribing
-      strike_rows: list[tuple] for live_strikes6_latest upsert (label/cp left NULL)
+    Example:
+      BAC ATM C 20260227 52.0 BAC 260227C00052000 51.89 2026-02-26 17:55:30.757915
     """
     try:
-        raws = []
-        strike_rows = []
-        seen = set()
-
-        ts_refresh = utc_now_naive()
+        raws: list[str] = []
+        strike_rows: list[tuple] = []
+        seen_raw = set()
+        seen_key = set()  # (parent, label, cp)
 
         with open(path, "r", encoding="utf-8") as f:
             for ln in f:
                 ln = ln.strip()
                 if not ln:
                     continue
+
                 parts = ln.split()
-                if len(parts) < 3:
-                    continue  # skip bad lines
+                # Need at least up to underlying_price; ts may be 2 tokens (date time)
+                if len(parts) < 8:
+                    continue
 
                 parent = parts[0]
-                raw = parts[1]
-                try:
-                    px = float(parts[2])
-                except Exception:
-                    px = None
+                label = parts[1]
+                cp = parts[2]  # "C" or "P"
+                exp_yyyymmdd = parts[3]
 
-                if raw not in seen:
-                    seen.add(raw)
+                # strike
+                try:
+                    strike = float(parts[4])
+                except Exception:
+                    continue
+
+                # parts[5] is root/underlying symbol (unused)
+                raw = parts[6]
+
+                try:
+                    underlying_px = float(parts[7])
+                except Exception:
+                    underlying_px = None
+
+                # ts_refresh: if present, parse; else set now
+                ts_refresh = utc_now_naive()
+                if len(parts) >= 10:
+                    ts_refresh = to_utc_naive(parts[8] + " " + parts[9]) or ts_refresh
+                elif len(parts) >= 9:
+                    ts_refresh = to_utc_naive(parts[8]) or ts_refresh
+
+                # expiration_date from exp_yyyymmdd
+                expiration_date = None
+                try:
+                    expiration_date = dt.datetime.strptime(exp_yyyymmdd, "%Y%m%d").date()
+                except Exception:
+                    expiration_date = None
+
+                if raw and raw not in seen_raw:
+                    seen_raw.add(raw)
                     raws.append(raw)
 
-                # minimal: store mapping + underlying_price; leave label/cp unknown
+                key = (parent, label, cp)
+                if key in seen_key:
+                    continue
+                seen_key.add(key)
+
+                # row aligns with upsert_meta VALUES order below
                 strike_rows.append(
-                    (parent, "UNIVERSE", "U", None, None, None, raw, px, ts_refresh)
+                    (
+                        parent,
+                        label,
+                        cp,
+                        exp_yyyymmdd,
+                        expiration_date,
+                        strike,
+                        raw,
+                        underlying_px,
+                        ts_refresh,
+                    )
                 )
 
         return raws, strike_rows
+
     except FileNotFoundError:
         return [], []
     except Exception:
@@ -216,7 +214,7 @@ def load_universe_cache(path: str):
 
 
 # -------------------------
-# STREAMER: SUBSCRIBE + STREAM -> UPSERT LIVE TABLES
+# STREAMER: SUBSCRIBE + STREAM -> UPSERT LIVE TABLE
 # -------------------------
 def subscribe_raws(live: db.Live, raws: list[str]):
     for batch in chunks(raws, SUB_BATCH_SIZE):
@@ -232,11 +230,29 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
     con = duckdb.connect(DUCKDB_LIVE_PATH)
 
+    upsert_meta = """
+    INSERT INTO live_contract_latest (
+      parent_symbol, label, instrument_class,
+      exp_yyyymmdd, expiration_date, strike_price,
+      raw_symbol, underlying_price, ts_refresh
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(raw_symbol) DO UPDATE SET
+      parent_symbol=excluded.parent_symbol,
+      label=excluded.label,
+      instrument_class=excluded.instrument_class,
+      exp_yyyymmdd=excluded.exp_yyyymmdd,
+      expiration_date=excluded.expiration_date,
+      strike_price=excluded.strike_price,
+      underlying_price=excluded.underlying_price,
+      ts_refresh=excluded.ts_refresh;
+    """
+
     upsert_quote = """
-    INSERT INTO live_quotes_latest (raw_symbol, ts_event, bid, ask, mid, spread, spread_pct)
+    INSERT INTO live_contract_latest (raw_symbol, ts_quote, bid, ask, mid, spread, spread_pct)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(raw_symbol) DO UPDATE SET
-      ts_event=excluded.ts_event,
+      ts_quote=excluded.ts_quote,
       bid=excluded.bid,
       ask=excluded.ask,
       mid=excluded.mid,
@@ -245,32 +261,35 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
     """
 
     upsert_vol = """
-    INSERT INTO live_vol10m_latest (raw_symbol, ts_calc, vol10m)
+    INSERT INTO live_contract_latest (raw_symbol, ts_vol, vol10m)
     VALUES (?, ?, ?)
     ON CONFLICT(raw_symbol) DO UPDATE SET
-      ts_calc=excluded.ts_calc,
+      ts_vol=excluded.ts_vol,
       vol10m=excluded.vol10m;
     """
 
-    upsert_strikes6 = """
-    INSERT INTO live_strikes6_latest (
-      parent_symbol, label, instrument_class,
-      exp_yyyymmdd, expiration_date, strike_price,
-      raw_symbol, underlying_price, ts_refresh
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(parent_symbol, label, instrument_class) DO UPDATE SET
-      raw_symbol=excluded.raw_symbol,
-      underlying_price=excluded.underlying_price,
-      ts_refresh=excluded.ts_refresh;
+    clear_old_labels = """
+    UPDATE live_contract_latest
+    SET
+      parent_symbol=NULL,
+      label=NULL,
+      instrument_class=NULL,
+      exp_yyyymmdd=NULL,
+      expiration_date=NULL,
+      strike_price=NULL,
+      underlying_price=NULL,
+      ts_refresh=NULL
+    WHERE parent_symbol = ?
+      AND label IN ('ATM','C1','P1','C2','P2')
+      AND instrument_class IN ('C','P');
     """
 
     if initial_strike_rows:
-        con.executemany(upsert_strikes6, initial_strike_rows)
+        con.executemany(upsert_meta, initial_strike_rows)
 
     live = db.Live(key=DATABENTO_API_KEY)
 
-    # --- CHANGE: use callback queue (Databento Live has no next_record) ---
+    # Use callback queue (Databento Live has no next_record)
     record_q = deque(maxlen=200_000)
     live.add_callback(lambda rec: record_q.append(rec))
 
@@ -303,7 +322,9 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
                 desired_raws, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
                 if strike_rows:
-                    con.executemany(upsert_strikes6, strike_rows)
+                    parents = sorted({row[0] for row in strike_rows})
+                    con.executemany(clear_old_labels, [(p,) for p in parents])
+                    con.executemany(upsert_meta, strike_rows)
 
                 if not desired_raws:
                     print(f"Universe cache empty/missing: {RAW_UNIVERSE_CACHE_PATH}")
@@ -316,7 +337,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     else:
                         print("No new raws to add from cache.")
 
-            # --- CHANGE: pop from callback queue instead of live.next_record() ---
+            # Pop from callback queue
             rec = record_q.popleft() if record_q else None
             now_sec = time.time()
 
@@ -328,6 +349,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     bid = getattr(rec, "bid_px_00", None)
                     ask = getattr(rec, "ask_px_00", None)
 
+                    # Quote record (cbbo-1m)
                     if bid is not None or ask is not None:
                         bid_f = float(bid) if bid is not None and bid > 0 else None
                         ask_f = float(ask) if ask is not None and ask > 0 else None
@@ -342,6 +364,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                             "spread_pct": spread_pct,
                         }
                     else:
+                        # Trade record (trades) -> rolling vol
                         size = getattr(rec, "size", None)
                         if size is not None:
                             try:
