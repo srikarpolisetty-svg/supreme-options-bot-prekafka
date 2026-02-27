@@ -320,27 +320,41 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         record_q.append(rec)
 
         # ---- PRINT incoming Databento messages/errors (rate-limited)
-        if PRINT_DB_RECORDS:
-            n = callback_state["count"]
-            rtype = getattr(rec, "rtype", None)
+        if not PRINT_DB_RECORDS:
+            return
 
-            is_error_like = False
-            if rtype is not None:
-                rs = str(rtype)
-                if rs.endswith("ERROR"):
-                    is_error_like = True
-                # also treat SYSTEM msgs as “from databento” (ACK/Heartbeat/End-of-interval)
-                if rs.endswith("SYSTEM"):
-                    is_error_like = True
+        n = callback_state["count"]
+        rtype = getattr(rec, "rtype", None)
+        rs = str(rtype) if rtype is not None else ""
 
-            if PRINT_DB_ERRORS_ONLY:
-                if is_error_like:
-                    print("[DB_MSG]", rec)
-            else:
-                if (PRINT_DB_EVERY_N <= 1) or ((n % PRINT_DB_EVERY_N) == 0) or is_error_like:
-                    print("[DB_MSG]", rec)
+        # ErrorMsg details (print always)
+        if type(rec).__name__ == "ErrorMsg" or rs.endswith("ERROR"):
+            try:
+                print("[DB_ERROR]", rec)
+                print("  err =", getattr(rec, "err", None))
+                print("  code =", getattr(rec, "code", None))
+                print("  instrument_id =", getattr(rec, "instrument_id", None))
+                print(
+                    "  symbol =",
+                    getattr(rec, "stype_in_symbol", None)
+                    or getattr(rec, "stype_out_symbol", None),
+                )
+            except Exception:
+                pass
+            return
 
-    # ---- MINIMAL FIX: correct callback signature for your Databento version
+        # System-ish messages (ACK/Heartbeat/End-of-interval) are useful
+        is_system_like = rs.endswith("SYSTEM")
+
+        if PRINT_DB_ERRORS_ONLY:
+            if is_system_like:
+                print("[DB_MSG]", rec)
+            return
+
+        # Normal printing: 1 out of N, OR always print system messages
+        if (PRINT_DB_EVERY_N <= 1) or ((n % PRINT_DB_EVERY_N) == 0) or is_system_like:
+            print("[DB_MSG]", rec)
+
     def _cb_exc(exc: Exception):
         print("[DB_CALLBACK_EXCEPTION]", repr(exc))
 
