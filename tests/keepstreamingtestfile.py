@@ -38,10 +38,9 @@ REFRESH_SEC = 10 * 60
 RESTART_HOUR_UTC = 24
 RESTART_MIN_UTC = 10
 
-DUCKDB_LIVE_PATH = "live_state.duckdb"
+DUCKDB_LIVE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/live_state.duckdb"
 
-# raw_symbol universe cache written by universe_builder (newline-delimited)
-RAW_UNIVERSE_CACHE_PATH = "state/raw_universe_cache.txt"
+RAW_UNIVERSE_CACHE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/state/raw_universe_cache.txt"
 
 # snapshot freshness gates (used by snapshot mode; harmless to keep here)
 STRIKES_MAX_AGE_MIN = 20
