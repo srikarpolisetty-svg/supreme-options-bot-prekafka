@@ -172,8 +172,10 @@ def load_universe_cache(path: str):
                 except Exception:
                     continue
 
-                # parts[5] is root/underlying symbol (unused)
-                raw = parts[6]
+                # parts[5] is root/underlying symbol
+                root = parts[5]
+                short_raw = parts[6]
+                raw = f"{root}  {short_raw}"  # <-- Databento OPRA raw_symbol format
 
                 try:
                     underlying_px = float(parts[7])
