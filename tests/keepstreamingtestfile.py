@@ -26,7 +26,7 @@ from config import DATABENTO_API_KEY
 # -------------------------
 # CONFIG
 # -------------------------
-SUB_BATCH_SIZE = 10
+SUB_BATCH_SIZE = 1
 SUB_SLEEP_SEC = 0.25
 
 VOL_WINDOW_SEC = 10 * 60
