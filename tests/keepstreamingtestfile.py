@@ -57,7 +57,7 @@ DEBUG_DRAIN_MAX_PER_LOOP = 500  # process up to N records per loop tick
 # -------------------------
 PRINT_DB_RECORDS = True            # master switch
 PRINT_DB_ERRORS_ONLY = False       # if True, prints only ERROR/System-ish messages
-PRINT_DB_EVERY_N = 200             # print 1 out of N records (set 1 to print everything)
+PRINT_DB_EVERY_N = 1     # print 1 out of N records (set 1 to print everything)
 
 
 # -------------------------
