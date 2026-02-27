@@ -57,7 +57,7 @@ DEBUG_DRAIN_MAX_PER_LOOP = 500  # process up to N records per loop tick
 # -------------------------
 PRINT_DB_RECORDS = True            # master switch
 PRINT_DB_ERRORS_ONLY = False       # if True, prints only ERROR/System-ish messages
-PRINT_DB_EVERY_N = 1     # print 1 out of N records (set 1 to print everything)
+PRINT_DB_EVERY_N = 1               # print 1 out of N records (set 1 to print everything)
 
 
 # -------------------------
@@ -243,7 +243,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
     vol_deques: dict[str, deque] = {}
     vol_latest: dict[str, dict] = {}
 
-    # ---- MINIMAL FIX: map instrument_id -> raw_symbol (SymbolMappingMsg carries it)
+    # map instrument_id -> raw_symbol (SymbolMappingMsg carries it)
     inst_to_raw: dict[int, str] = {}
 
     con = duckdb.connect(DUCKDB_LIVE_PATH)
@@ -308,10 +308,8 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
     live = db.Live(key=DATABENTO_API_KEY)
 
-    # Use callback queue (Databento Live has no next_record)
     record_q = deque(maxlen=200_000)
 
-    # DEBUG: prove the callback is actually firing
     callback_state = {"count": 0, "last_ts": time.time()}
 
     def _cb(rec):
@@ -319,7 +317,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         callback_state["last_ts"] = time.time()
         record_q.append(rec)
 
-        # ---- PRINT incoming Databento messages/errors (rate-limited)
+        # ---- PRINT incoming Databento messages/errors
         if not PRINT_DB_RECORDS:
             return
 
@@ -328,9 +326,10 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         rs = str(rtype) if rtype is not None else ""
 
         # ErrorMsg details (print always)
-        if type(rec).__name__ == "ErrorMsg" or rs.endswith("ERROR"):
+        if type(rec).__name__ in ("ErrorMsg", "ErrMsg") or rs.endswith("ERROR"):
             try:
                 print("[DB_ERROR]", rec)
+                print("  msg =", getattr(rec, "msg", None) or getattr(rec, "text", None))
                 print("  err =", getattr(rec, "err", None))
                 print("  code =", getattr(rec, "code", None))
                 print("  instrument_id =", getattr(rec, "instrument_id", None))
@@ -343,8 +342,8 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                 pass
             return
 
-        # System-ish messages (ACK/Heartbeat/End-of-interval) are useful
-        is_system_like = rs.endswith("SYSTEM")
+        # System-ish messages are useful
+        is_system_like = rs.endswith("SYSTEM") or type(rec).__name__ == "SystemMsg"
 
         if PRINT_DB_ERRORS_ONLY:
             if is_system_like:
@@ -358,6 +357,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
     def _cb_exc(exc: Exception):
         print("[DB_CALLBACK_EXCEPTION]", repr(exc))
 
+    # IMPORTANT: match your working file
     live.add_callback(record_callback=_cb, exception_callback=_cb_exc)
 
     # -------------------------
@@ -422,7 +422,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
             now_sec = time.time()
 
-            # DEBUG: queue + callback health
             if (now_sec - last_debug_print) >= DEBUG_PRINT_EVERY_SEC:
                 cb_count = callback_state["count"]
                 cb_age = now_sec - callback_state["last_ts"]
@@ -435,7 +434,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                 )
                 last_debug_print = now_sec
 
-            # Drain multiple records per loop tick
             drained = 0
             while record_q and drained < DEBUG_DRAIN_MAX_PER_LOOP:
                 rec = record_q.popleft()
@@ -453,7 +451,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     except Exception:
                         pass
 
-                # ---- MINIMAL FIX: capture mapping (instrument_id -> raw_symbol) from SymbolMappingMsg
+                # capture mapping (instrument_id -> raw_symbol) from SymbolMappingMsg
                 rtype = getattr(rec, "rtype", None)
                 if rtype is not None and str(rtype).endswith("SYMBOL_MAPPING"):
                     inst = getattr(rec, "instrument_id", None)
@@ -462,14 +460,14 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                         inst_to_raw[int(inst)] = str(sym)
                     continue
 
-                # ---- MINIMAL FIX: resolve raw_symbol via instrument_id mapping (cbbo/trades usually only have instrument_id)
+                # resolve raw_symbol via instrument_id mapping (cbbo/trades usually only have instrument_id)
                 inst = getattr(rec, "instrument_id", None)
                 raw = inst_to_raw.get(int(inst)) if inst is not None else None
 
                 if raw:
                     ts_event = to_utc_naive(getattr(rec, "ts_event", None))
 
-                    # ---- MINIMAL FIX: use pretty_* fields so bid/ask are real floats (13.6 not 13600000000)
+                    # use pretty_* fields so bid/ask are real floats
                     bid = getattr(rec, "pretty_bid_px_00", None)
                     ask = getattr(rec, "pretty_ask_px_00", None)
 
