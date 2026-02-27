@@ -52,6 +52,13 @@ DEBUG_PRINT_EVERY_SEC = 5.0  # how often to print queue/counters
 DEBUG_PRINT_FIRST_N_RECORDS = 3  # print repr/dir of first N records to verify fields
 DEBUG_DRAIN_MAX_PER_LOOP = 500  # process up to N records per loop tick
 
+# -------------------------
+# DATABENTO PRINTS (NEW)
+# -------------------------
+PRINT_DB_RECORDS = True            # master switch
+PRINT_DB_ERRORS_ONLY = False       # if True, prints only ERROR/System-ish messages
+PRINT_DB_EVERY_N = 200             # print 1 out of N records (set 1 to print everything)
+
 
 # -------------------------
 # DUCKDB (LIVE) TABLE (SINGLE)
@@ -310,9 +317,30 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         callback_state["last_ts"] = time.time()
         record_q.append(rec)
 
+        # ---- PRINT incoming Databento messages/errors (rate-limited)
+        if PRINT_DB_RECORDS:
+            n = callback_state["count"]
+            rtype = getattr(rec, "rtype", None)
+
+            is_error_like = False
+            if rtype is not None:
+                rs = str(rtype)
+                if rs.endswith("ERROR"):
+                    is_error_like = True
+                # also treat SYSTEM msgs as “from databento” (ACK/Heartbeat/End-of-interval)
+                if rs.endswith("SYSTEM"):
+                    is_error_like = True
+
+            if PRINT_DB_ERRORS_ONLY:
+                if is_error_like:
+                    print("[DB_MSG]", rec)
+            else:
+                if (PRINT_DB_EVERY_N <= 1) or ((n % PRINT_DB_EVERY_N) == 0) or is_error_like:
+                    print("[DB_MSG]", rec)
+
     # ---- MINIMAL FIX: correct callback signature for your Databento version
     def _cb_exc(exc: Exception):
-        print("[CALLBACK_EXCEPTION]", repr(exc))
+        print("[DB_CALLBACK_EXCEPTION]", repr(exc))
 
     live.add_callback(record_callback=_cb, exception_callback=_cb_exc)
 
