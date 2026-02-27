@@ -234,6 +234,9 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
     vol_deques: dict[str, deque] = {}
     vol_latest: dict[str, dict] = {}
 
+    # ---- MINIMAL FIX: map instrument_id -> raw_symbol (SymbolMappingMsg carries it)
+    inst_to_raw: dict[int, str] = {}
+
     con = duckdb.connect(DUCKDB_LIVE_PATH)
 
     upsert_meta = """
@@ -307,7 +310,11 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         callback_state["last_ts"] = time.time()
         record_q.append(rec)
 
-    live.add_callback(_cb)
+    # ---- MINIMAL FIX: correct callback signature for your Databento version
+    def _cb_exc(exc: Exception):
+        print("[CALLBACK_EXCEPTION]", repr(exc))
+
+    live.add_callback(record_callback=_cb, exception_callback=_cb_exc)
 
     # -------------------------
     # DEBUG STATE
@@ -402,12 +409,25 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     except Exception:
                         pass
 
-                raw = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
+                # ---- MINIMAL FIX: capture mapping (instrument_id -> raw_symbol) from SymbolMappingMsg
+                rtype = getattr(rec, "rtype", None)
+                if rtype is not None and str(rtype).endswith("SYMBOL_MAPPING"):
+                    inst = getattr(rec, "instrument_id", None)
+                    sym = getattr(rec, "stype_in_symbol", None) or getattr(rec, "stype_out_symbol", None)
+                    if inst is not None and sym:
+                        inst_to_raw[int(inst)] = str(sym)
+                    continue
+
+                # ---- MINIMAL FIX: resolve raw_symbol via instrument_id mapping (cbbo/trades usually only have instrument_id)
+                inst = getattr(rec, "instrument_id", None)
+                raw = inst_to_raw.get(int(inst)) if inst is not None else None
+
                 if raw:
                     ts_event = to_utc_naive(getattr(rec, "ts_event", None))
 
-                    bid = getattr(rec, "bid_px_00", None)
-                    ask = getattr(rec, "ask_px_00", None)
+                    # ---- MINIMAL FIX: use pretty_* fields so bid/ask are real floats (13.6 not 13600000000)
+                    bid = getattr(rec, "pretty_bid_px_00", None)
+                    ask = getattr(rec, "pretty_ask_px_00", None)
 
                     # Quote record (cbbo-1m)
                     if bid is not None or ask is not None:
