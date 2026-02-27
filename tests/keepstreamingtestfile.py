@@ -35,11 +35,11 @@ FLUSH_EVERY_SEC = 1.0
 # universe refresh cadence (reload raw_symbol cache file, subscribe new)
 REFRESH_SEC = 10 * 60
 
-RESTART_HOUR_UTC = 24
+# NOTE: 24 is not a real hour. Keep this valid to avoid weird exits.
+RESTART_HOUR_UTC = 23
 RESTART_MIN_UTC = 10
 
 DUCKDB_LIVE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/live_state.duckdb"
-
 RAW_UNIVERSE_CACHE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/state/raw_universe_cache.txt"
 
 # snapshot freshness gates (used by snapshot mode; harmless to keep here)
@@ -50,6 +50,7 @@ STRIKES_MAX_AGE_MIN = 20
 # -------------------------
 DEBUG_PRINT_EVERY_SEC = 5.0  # how often to print queue/counters
 DEBUG_PRINT_FIRST_N_RECORDS = 3  # print repr/dir of first N records to verify fields
+DEBUG_DRAIN_MAX_PER_LOOP = 500  # process up to N records per loop tick
 
 
 # -------------------------
@@ -297,7 +298,16 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
     # Use callback queue (Databento Live has no next_record)
     record_q = deque(maxlen=200_000)
-    live.add_callback(lambda rec: record_q.append(rec))
+
+    # DEBUG: prove the callback is actually firing
+    callback_state = {"count": 0, "last_ts": time.time()}
+
+    def _cb(rec):
+        callback_state["count"] += 1
+        callback_state["last_ts"] = time.time()
+        record_q.append(rec)
+
+    live.add_callback(_cb)
 
     # -------------------------
     # DEBUG STATE
@@ -359,21 +369,27 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     else:
                         print("No new raws to add from cache.")
 
-            # Pop from callback queue
-            rec = record_q.popleft() if record_q else None
             now_sec = time.time()
 
-            # DEBUG: queue health print
+            # DEBUG: queue + callback health
             if (now_sec - last_debug_print) >= DEBUG_PRINT_EVERY_SEC:
+                cb_count = callback_state["count"]
+                cb_age = now_sec - callback_state["last_ts"]
                 print(
                     f"[DEBUG] queue={len(record_q)} "
+                    f"cb_count={cb_count} cb_age_sec={cb_age:.2f} "
                     f"seen_records={seen_records} quotes={seen_quotes} trades={seen_trades} "
                     f"quote_cache={len(quote_latest)} vol_cache={len(vol_latest)} "
                     f"subscribed={len(subscribed)}"
                 )
                 last_debug_print = now_sec
 
-            if rec is not None:
+            # Drain multiple records per loop tick
+            drained = 0
+            while record_q and drained < DEBUG_DRAIN_MAX_PER_LOOP:
+                rec = record_q.popleft()
+                drained += 1
+
                 seen_records += 1
 
                 if printed_records < DEBUG_PRINT_FIRST_N_RECORDS:
@@ -381,7 +397,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
                     try:
                         raw_dbg = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
                         print(f"[DEBUG] record#{printed_records} type={type(rec)} raw={raw_dbg}")
-                        # print a small attribute sample to confirm field names
                         attrs = [a for a in dir(rec) if "px" in a or a in ("symbol", "raw_symbol", "ts_event", "size")]
                         print(f"[DEBUG] record#{printed_records} attrs_sample={attrs[:40]}")
                     except Exception:
@@ -458,7 +473,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
                 print(
                     f"flush quotes={len(quote_latest)} vol={len(vol_latest)} subscribed={len(subscribed)} "
-                    f"(seen_records={seen_records} quotes={seen_quotes} trades={seen_trades})"
+                    f"(seen_records={seen_records} quotes={seen_quotes} trades={seen_trades} cb_count={callback_state['count']})"
                 )
 
     except KeyboardInterrupt:
