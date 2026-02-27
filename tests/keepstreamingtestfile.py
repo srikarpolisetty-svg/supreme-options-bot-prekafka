@@ -175,7 +175,11 @@ def load_universe_cache(path: str):
                 # parts[5] is root/underlying symbol
                 root = parts[5]
                 short_raw = parts[6]
-                raw = f"{root}  {short_raw}"  # <-- Databento OPRA raw_symbol format
+
+                # ✅ FIX: Databento OPRA raw_symbol is root left-justified to width 6 + 15-char option code
+                #    AAPL -> "AAPL  " + short_raw
+                #    ABT  -> "ABT   " + short_raw
+                raw = f"{root:<6}{short_raw}"
 
                 try:
                     underlying_px = float(parts[7])
